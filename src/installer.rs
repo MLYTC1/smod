@@ -53,6 +53,12 @@ pub enum InstallError {
     #[error("invalid package archive: {message}")]
     InvalidArchive { message: String },
 
+    /// The archive contained an entry whose path is unsafe — absolute,
+    /// drive-prefixed, or escaping the destination via `..`. The whole archive
+    /// is rejected rather than the entry being silently skipped.
+    #[error("unsafe path in package archive: {entry:?}")]
+    UnsafeArchiveEntry { entry: String },
+
     /// Extraction failed with an I/O error.
     #[error("failed to extract archive: {source}")]
     ExtractIo {
@@ -284,48 +290,59 @@ impl<'a, R: RegistryClient> Installer<'a, R> {
 
     /// Extract a zip archive's bytes into `dest`.
     ///
-    /// Uses `enclosed_name()` to reject absolute paths and `..` components
-    /// (zip-slip protection). If every entry shares one common top-level
-    /// directory (the conventional `payment-stream/README.md` layout), that
-    /// prefix is stripped — but only when doing so would not erase a root-level
-    /// file.
+    /// Security model: the archive is validated *in full before anything is
+    /// written*. Every entry must have a safe relative path per
+    /// `enclosed_name()` (which rejects absolute paths, drive prefixes, and
+    /// `..` components — "zip slip"). A single unsafe entry rejects the whole
+    /// archive with [`InstallError::UnsafeArchiveEntry`]; unsafe entries are
+    /// never silently skipped, and because validation precedes the write pass,
+    /// a rejected archive leaves no partially-extracted files behind.
+    ///
+    /// If every entry shares one common top-level directory (the conventional
+    /// `payment-stream/README.md` layout), that prefix is stripped — but only
+    /// when doing so would not erase a root-level file.
     pub fn extract_package(&self, bytes: &[u8], dest: &Path) -> Result<(), InstallError> {
         let mut archive =
             zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| InstallError::InvalidArchive {
                 message: e.to_string(),
             })?;
 
-        // First pass: gather safe entry paths (normalized, forward slashes).
-        let mut entries: Vec<(String, bool)> = Vec::with_capacity(archive.len());
+        // First pass: validate and record every entry. An entry whose path is
+        // not a safe relative path makes the whole archive invalid.
+        let mut names: Vec<String> = Vec::with_capacity(archive.len());
+        let mut is_dir: Vec<bool> = Vec::with_capacity(archive.len());
         for i in 0..archive.len() {
             let file = archive
                 .by_index(i)
                 .map_err(|e| InstallError::InvalidArchive {
                     message: e.to_string(),
                 })?;
-            // Unsafe names (absolute, `..`) yield None and are skipped.
-            if let Some(name) = file.enclosed_name() {
-                let normalized = name.to_string_lossy().replace('\\', "/");
-                if !normalized.is_empty() {
-                    entries.push((normalized, file.is_dir()));
-                }
-            }
+            // `None` == unsafe (absolute, drive-prefixed, or contains `..`).
+            let safe = file
+                .enclosed_name()
+                .ok_or_else(|| InstallError::UnsafeArchiveEntry {
+                    entry: file.name().to_string(),
+                })?;
+            names.push(safe.to_string_lossy().replace('\\', "/"));
+            is_dir.push(file.is_dir());
         }
 
+        // Compute the strippable wrapper directory from the safe, non-empty
+        // names only. (An empty name is a benign current-dir/root marker that
+        // resolves to `dest` itself — it must not disable stripping.)
+        let entries: Vec<(String, bool)> = names
+            .iter()
+            .cloned()
+            .zip(is_dir.iter().copied())
+            .filter(|(name, _)| !name.is_empty())
+            .collect();
         let strip = common_prefix(&entries);
 
-        // Second pass: extract.
+        // Second pass: extract. Every `names[i]` here is already known safe.
         std::fs::create_dir_all(dest).map_err(|source| InstallError::ExtractIo { source })?;
         for i in 0..archive.len() {
-            let mut file = archive
-                .by_index(i)
-                .map_err(|e| InstallError::InvalidArchive {
-                    message: e.to_string(),
-                })?;
-            let name = match file.enclosed_name() {
-                Some(n) => n.to_string_lossy().replace('\\', "/"),
-                None => continue,
-            };
+            let name = &names[i];
+            // Benign marker entry that resolves to `dest` itself; no content.
             if name.is_empty() {
                 continue;
             }
@@ -340,7 +357,12 @@ impl<'a, R: RegistryClient> Installer<'a, R> {
             };
 
             let target = dest.join(&relative);
-            if file.is_dir() {
+            let mut file = archive
+                .by_index(i)
+                .map_err(|e| InstallError::InvalidArchive {
+                    message: e.to_string(),
+                })?;
+            if is_dir[i] {
                 std::fs::create_dir_all(&target)
                     .map_err(|source| InstallError::ExtractIo { source })?;
             } else {
@@ -615,6 +637,68 @@ mod tests {
         let installed = installer.install("multi").await.unwrap();
         assert!(installed.install_path.join("a.txt").is_file());
         assert!(installed.install_path.join("b.txt").is_file());
+    }
+
+    // --- security: zip-slip / unsafe archive entries --------------------
+
+    #[tokio::test]
+    async fn extract_rejects_parent_dir_traversal() {
+        let zip = make_zip(&[("../evil.txt", b"pwned")]);
+        let (tmp, registry) = scaffold("p", &zip, None);
+        let installer = Installer::new(&registry, tmp.path().to_path_buf());
+        let err = installer.install("p").await.unwrap_err();
+        assert!(
+            matches!(err, InstallError::UnsafeArchiveEntry { .. }),
+            "got {err:?}"
+        );
+        // Nothing escaped, and nothing was partially extracted.
+        assert!(!tmp.path().parent().unwrap().join("evil.txt").exists());
+        assert!(!config::modules_dir_in(tmp.path()).join("p").exists());
+    }
+
+    #[tokio::test]
+    async fn extract_rejects_absolute_paths() {
+        let zip = make_zip(&[("/absolute/evil.txt", b"pwned")]);
+        let (tmp, registry) = scaffold("p", &zip, None);
+        let installer = Installer::new(&registry, tmp.path().to_path_buf());
+        let err = installer.install("p").await.unwrap_err();
+        assert!(
+            matches!(err, InstallError::UnsafeArchiveEntry { .. }),
+            "got {err:?}"
+        );
+        assert!(!config::modules_dir_in(tmp.path()).join("p").exists());
+    }
+
+    #[tokio::test]
+    async fn extract_rejects_archive_of_only_invalid_entries() {
+        let zip = make_zip(&[("../a.txt", b"a"), ("../../b.txt", b"b")]);
+        let (tmp, registry) = scaffold("p", &zip, None);
+        let installer = Installer::new(&registry, tmp.path().to_path_buf());
+        let err = installer.install("p").await.unwrap_err();
+        assert!(
+            matches!(err, InstallError::UnsafeArchiveEntry { .. }),
+            "got {err:?}"
+        );
+        assert!(!config::modules_dir_in(tmp.path()).join("p").exists());
+    }
+
+    #[tokio::test]
+    async fn extract_rejects_mixed_valid_and_unsafe_without_partial_install() {
+        // A safe entry precedes an unsafe one: the whole archive must be
+        // rejected, and the safe entry must NOT have been written.
+        let zip = make_zip(&[("pkg/good.txt", b"good"), ("../evil.txt", b"evil")]);
+        let (tmp, registry) = scaffold("pkg", &zip, None);
+        let installer = Installer::new(&registry, tmp.path().to_path_buf());
+        let err = installer.install("pkg").await.unwrap_err();
+        assert!(
+            matches!(err, InstallError::UnsafeArchiveEntry { .. }),
+            "got {err:?}"
+        );
+        assert!(!tmp.path().parent().unwrap().join("evil.txt").exists());
+        // No partial extraction of the good file.
+        assert!(!config::modules_dir_in(tmp.path()).join("pkg").exists());
+        // And the install was not recorded.
+        assert!(lockfile::read(tmp.path()).unwrap().get("pkg").is_none());
     }
 
     #[tokio::test]
