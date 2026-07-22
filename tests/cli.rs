@@ -64,6 +64,24 @@ fn new_creates_a_full_project_layout() {
 }
 
 #[test]
+fn new_prints_a_shell_independent_next_hint() {
+    let tmp = TempDir::new().unwrap();
+    let out = smod(tmp.path(), &["new", "my-module"]);
+    assert!(out.status.success(), "`smod new` failed: {}", stderr(&out));
+
+    let text = stdout(&out);
+    // The hint must not use `&&`, which Windows PowerShell 5.1 can't parse.
+    assert!(
+        !text.contains("&&"),
+        "next hint should not use `&&`: {text}"
+    );
+    // Each step is printed on its own line so it's copy-pasteable everywhere.
+    assert!(text.contains("next:"), "was: {text}");
+    assert!(text.contains("cd my-module"), "was: {text}");
+    assert!(text.contains("smod install"), "was: {text}");
+}
+
+#[test]
 fn new_rejects_an_invalid_name() {
     let tmp = TempDir::new().unwrap();
     let out = smod(tmp.path(), &["new", "../escape"]);

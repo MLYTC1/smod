@@ -39,6 +39,11 @@ pub async fn run(args: NewArgs) -> anyhow::Result<()> {
         println!("  {} {}", "+".green(), shown.display());
     }
     println!();
-    println!("  {} cd {} && smod install", "next:".dimmed(), args.name);
+    // Print the next steps as separate commands rather than joining them with
+    // `&&`, which isn't a valid separator in Windows PowerShell 5.1. One command
+    // per line is shell-independent and copy-pasteable everywhere.
+    println!("  {}", "next:".dimmed());
+    println!("    cd {}", args.name);
+    println!("    smod install");
     Ok(())
 }
