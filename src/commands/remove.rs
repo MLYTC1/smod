@@ -8,6 +8,12 @@ use crate::installer;
 
 /// Arguments for `smod remove`.
 #[derive(Args, Debug)]
+#[command(
+    long_about = "Remove an installed package: delete its smod_modules/ \
+                  directory and drop its entries from smod.lock and smod.toml.",
+    after_help = "Examples:\n  \
+        Remove an installed package:\n    smod remove payment-stream"
+)]
 pub struct RemoveArgs {
     /// The package to remove.
     pub package: String,

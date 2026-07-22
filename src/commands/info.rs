@@ -7,6 +7,13 @@ use crate::registry::{MockRegistryClient, RegistryClient};
 
 /// Arguments for `smod info`.
 #[derive(Args, Debug)]
+#[command(
+    long_about = "Show detailed registry metadata for a single package: its \
+                  version, description, author, program id, archive location, \
+                  and checksum.",
+    after_help = "Examples:\n  \
+        Show details for a package:\n    smod info payment-stream"
+)]
 pub struct InfoArgs {
     /// The package name to look up.
     pub package: String,

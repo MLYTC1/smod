@@ -14,6 +14,15 @@ use crate::ui;
 
 /// Arguments for `smod install`.
 #[derive(Args, Debug)]
+#[command(
+    long_about = "Install a package from the registry, or install every \
+                  dependency declared in smod.toml. Installing updates \
+                  smod.toml and smod.lock and extracts the package into \
+                  smod_modules/.",
+    after_help = "Examples:\n  \
+        Install one package:\n    smod install payment-stream\n\n  \
+        Install all dependencies declared in smod.toml:\n    smod install"
+)]
 pub struct InstallArgs {
     /// The package to install. If omitted, installs every declared dependency.
     pub package: Option<String>,

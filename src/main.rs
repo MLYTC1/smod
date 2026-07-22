@@ -2,11 +2,12 @@
 //!
 //! Parses argv, applies `--no-color`, and dispatches to the right command
 //! module. There is no business logic here by design — `dispatch` is the only
-//! place that knows all nine subcommands exist.
+//! place that knows all the subcommands exist.
 
 mod cli;
 mod commands;
 mod config;
+mod doctor;
 mod installer;
 mod lockfile;
 mod package;
@@ -44,5 +45,6 @@ async fn dispatch(command: Commands) -> anyhow::Result<()> {
         Commands::Info(args) => commands::info::run(args).await,
         Commands::Doctor(args) => commands::doctor::run(args).await,
         Commands::Update(args) => commands::update::run(args).await,
+        Commands::Verify(args) => commands::verify::run(args).await,
     }
 }

@@ -61,6 +61,12 @@ smod remove payment-stream
 # Update installed packages to the newest version the registry offers
 smod update              # all installed packages
 smod update payment-stream   # just one
+
+# Verify installed packages match their recorded checksums
+smod verify
+
+# Diagnose the local project and environment
+smod doctor
 ```
 
 Global flags: `--no-color` disables colored output; `--verbose` is accepted
@@ -74,9 +80,9 @@ containing sample Solana modules: `payment-stream`, `token-vault`, `nft-mint`,
 
 ### Not yet implemented
 
-`smod publish` and `smod doctor` are intentionally unimplemented today. They
-fail clearly with a non-zero exit code (rather than silently doing nothing) and
-explain what is needed to implement them.
+`smod publish` is intentionally unimplemented today. It fails clearly with a
+non-zero exit code (rather than silently doing nothing) and explains what is
+needed to implement it.
 
 ## Project layout
 
@@ -85,7 +91,8 @@ src/
 ├── main.rs          # entry point: parse argv, dispatch (no logic)
 ├── cli.rs           # clap schema (pure data)
 ├── commands/        # one file per subcommand (orchestration only)
-├── installer.rs     # install/remove workflows (business logic)
+├── installer.rs     # install/remove/update/verify workflows (business logic)
+├── doctor.rs        # environment diagnostics (business logic)
 ├── config.rs        # smod.toml filesystem boundary
 ├── lockfile.rs      # smod.lock read/write + timestamps
 ├── registry.rs      # RegistryClient trait + MockRegistryClient

@@ -7,6 +7,13 @@ use crate::registry::{MockRegistryClient, RegistryClient};
 
 /// Arguments for `smod search`.
 #[derive(Args, Debug)]
+#[command(
+    long_about = "Search the registry for packages whose name or description \
+                  matches the query. The match is case-insensitive.",
+    after_help = "Examples:\n  \
+        Search by keyword:\n    smod search vault\n\n  \
+        Search matches descriptions too:\n    smod search payments"
+)]
 pub struct SearchArgs {
     /// The query to match against package names and descriptions.
     pub query: String,

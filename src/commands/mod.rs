@@ -14,3 +14,4 @@ pub mod publish;
 pub mod remove;
 pub mod search;
 pub mod update;
+pub mod verify;

@@ -160,6 +160,38 @@ pub enum UpdateOutcome {
     Failed { name: String, error: InstallError },
 }
 
+/// The result of verifying a single installed package during
+/// [`Installer::verify`].
+///
+/// Like [`DependencyOutcome`] and [`UpdateOutcome`], this is a typed result the
+/// business layer returns and the command layer renders — no strings are
+/// printed here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerificationStatus {
+    /// The recomputed archive checksum matches the lockfile.
+    Verified,
+    /// The archive was found but its checksum no longer matches the lockfile —
+    /// the package has been corrupted or tampered with since install.
+    ChecksumMismatch { expected: String, actual: String },
+    /// The extracted module directory (`smod_modules/<name>/`) is missing.
+    ModuleMissing,
+    /// The archive could not be located or read to recompute its checksum
+    /// (e.g. absent from the registry, or unreadable on disk). Carries a
+    /// rendered reason since the underlying causes are heterogeneous.
+    ArchiveUnavailable { reason: String },
+}
+
+/// The verification outcome for one installed (locked) package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageVerification {
+    /// Package name.
+    pub name: String,
+    /// The version recorded in `smod.lock`.
+    pub version: String,
+    /// What verification found.
+    pub status: VerificationStatus,
+}
+
 /// Installs and inspects packages against a given registry client and project
 /// root.
 pub struct Installer<'a, R: RegistryClient> {
@@ -195,19 +227,7 @@ impl<'a, R: RegistryClient> Installer<'a, R> {
         package::validate_package_name(&info.name)?;
 
         // 3. Resolve where the archive lives, and 4. read its bytes.
-        let archive_path = self.resolve_archive_path(&info.archive);
-        let bytes = std::fs::read(&archive_path).map_err(|source| {
-            if source.kind() == std::io::ErrorKind::NotFound {
-                InstallError::ArchiveMissing {
-                    path: archive_path.clone(),
-                }
-            } else {
-                InstallError::ArchiveIo {
-                    path: archive_path.clone(),
-                    source,
-                }
-            }
-        })?;
+        let bytes = self.read_archive(&info)?;
 
         // 5. Compute and 6. verify the checksum.
         let checksum = Self::compute_checksum(&bytes);
@@ -376,6 +396,101 @@ impl<'a, R: RegistryClient> Installer<'a, R> {
         }
     }
 
+    /// Verify that every installed (locked) package is intact.
+    ///
+    /// The set of packages is read from `smod.lock`. For each one, the
+    /// extracted module directory must exist, and the archive it was installed
+    /// from (located through the [`RegistryClient`] trait) must still hash to
+    /// the checksum recorded in the lockfile — recomputed with the same
+    /// [`compute_checksum`] used at install time, so no checksum logic is
+    /// duplicated. Each package folds into a [`PackageVerification`] rather than
+    /// aborting the run, so a single corrupted package does not hide the status
+    /// of the rest.
+    ///
+    /// Note: the lockfile records the checksum of the *archive*, so this detects
+    /// a changed/corrupted archive or a tampered lockfile, plus a missing module
+    /// directory. Only project-level problems (not a project, an unreadable
+    /// `smod.lock`) fail the whole call.
+    ///
+    /// [`compute_checksum`]: Installer::compute_checksum
+    pub async fn verify(&self) -> Result<Vec<PackageVerification>, InstallError> {
+        if !config::is_smod_project(&self.project_root) {
+            return Err(InstallError::NotASmodProject {
+                path: self.project_root.clone(),
+            });
+        }
+
+        let lock = lockfile::read(&self.project_root)?;
+        let mut results = Vec::with_capacity(lock.packages.len());
+        for locked in &lock.packages {
+            results.push(self.verify_one(locked).await);
+        }
+        Ok(results)
+    }
+
+    /// Verify a single locked package, producing a [`PackageVerification`].
+    /// Never returns `Err` — every failure mode is folded into a
+    /// [`VerificationStatus`] so the batch is never aborted.
+    async fn verify_one(&self, locked: &LockedPackage) -> PackageVerification {
+        let name = locked.name.clone();
+        let version = locked.version.clone();
+
+        // 1. The extracted module directory must be present.
+        let module_dir = config::modules_dir_in(&self.project_root).join(&name);
+        if !module_dir.exists() {
+            return PackageVerification {
+                name,
+                version,
+                status: VerificationStatus::ModuleMissing,
+            };
+        }
+
+        // 2. Locate the archive via the registry and recompute its checksum.
+        let info = match self.registry.get_package(&name).await {
+            Ok(info) => info,
+            Err(source) => {
+                return PackageVerification {
+                    name,
+                    version,
+                    status: VerificationStatus::ArchiveUnavailable {
+                        reason: source.to_string(),
+                    },
+                };
+            }
+        };
+        let bytes = match self.read_archive(&info) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return PackageVerification {
+                    name,
+                    version,
+                    status: VerificationStatus::ArchiveUnavailable {
+                        reason: err.to_string(),
+                    },
+                };
+            }
+        };
+
+        // 3. Compare the recomputed checksum against the lockfile's.
+        let actual = Self::compute_checksum(&bytes);
+        if actual.eq_ignore_ascii_case(&locked.checksum) {
+            PackageVerification {
+                name,
+                version,
+                status: VerificationStatus::Verified,
+            }
+        } else {
+            PackageVerification {
+                name,
+                version,
+                status: VerificationStatus::ChecksumMismatch {
+                    expected: locked.checksum.clone(),
+                    actual,
+                },
+            }
+        }
+    }
+
     /// Resolve `PackageInfo::archive` to an absolute filesystem path.
     ///
     /// Absolute paths are used as-is (tests point these at temp-dir fixtures);
@@ -389,6 +504,31 @@ impl<'a, R: RegistryClient> Installer<'a, R> {
         } else {
             Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
         }
+    }
+
+    /// Resolve and read a package's archive bytes, mapping I/O failures onto the
+    /// typed [`InstallError`] variants callers can branch on.
+    ///
+    /// Extracted so the install pipeline (step 3/4) and [`verify`] share exactly
+    /// one archive-reading path rather than duplicating the resolve-then-read
+    /// logic. This is also the single spot that becomes an HTTP fetch when HTTP
+    /// support lands (see `ARCHITECTURE.md`).
+    ///
+    /// [`verify`]: Installer::verify
+    fn read_archive(&self, info: &PackageInfo) -> Result<Vec<u8>, InstallError> {
+        let archive_path = self.resolve_archive_path(&info.archive);
+        std::fs::read(&archive_path).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                InstallError::ArchiveMissing {
+                    path: archive_path.clone(),
+                }
+            } else {
+                InstallError::ArchiveIo {
+                    path: archive_path.clone(),
+                    source,
+                }
+            }
+        })
     }
 
     /// Compute the SHA-256 checksum of `bytes` as a lowercase hex string.
@@ -1527,5 +1667,121 @@ mod tests {
                 .version,
             "1.0.0"
         );
+    }
+
+    // --- verify ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn verify_reports_verified_for_intact_package() {
+        let tmp = TempDir::new().unwrap();
+        config::write_manifest(tmp.path(), &Manifest::new("host")).unwrap();
+        let zip = make_zip(&[("p/lib.rs", b"v1")]);
+        let archive = tmp.path().join("p.zip");
+        std::fs::write(&archive, &zip).unwrap();
+        let registry = MockRegistryClient::from_packages(vec![pkg_info("p", "1.0.0", &archive)]);
+        let installer = Installer::new(&registry, tmp.path().to_path_buf());
+        installer.install("p").await.unwrap();
+
+        let results = installer.verify().await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "p");
+        assert_eq!(results[0].status, VerificationStatus::Verified);
+    }
+
+    #[tokio::test]
+    async fn verify_detects_modified_archive() {
+        let tmp = TempDir::new().unwrap();
+        config::write_manifest(tmp.path(), &Manifest::new("host")).unwrap();
+        let zip = make_zip(&[("p/lib.rs", b"v1")]);
+        let archive = tmp.path().join("p.zip");
+        std::fs::write(&archive, &zip).unwrap();
+        let registry = MockRegistryClient::from_packages(vec![pkg_info("p", "1.0.0", &archive)]);
+        let installer = Installer::new(&registry, tmp.path().to_path_buf());
+        installer.install("p").await.unwrap();
+
+        // Tamper with the archive after install; its checksum no longer matches
+        // what the lockfile recorded at install time.
+        let tampered = make_zip(&[("p/lib.rs", b"tampered contents")]);
+        std::fs::write(&archive, &tampered).unwrap();
+
+        let results = installer.verify().await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(
+                results[0].status,
+                VerificationStatus::ChecksumMismatch { .. }
+            ),
+            "got {:?}",
+            results[0].status
+        );
+        assert_ne!(results[0].status, VerificationStatus::Verified);
+    }
+
+    #[tokio::test]
+    async fn verify_detects_missing_module_directory() {
+        let tmp = TempDir::new().unwrap();
+        config::write_manifest(tmp.path(), &Manifest::new("host")).unwrap();
+        let zip = make_zip(&[("p/lib.rs", b"v1")]);
+        let archive = tmp.path().join("p.zip");
+        std::fs::write(&archive, &zip).unwrap();
+        let registry = MockRegistryClient::from_packages(vec![pkg_info("p", "1.0.0", &archive)]);
+        let installer = Installer::new(&registry, tmp.path().to_path_buf());
+        installer.install("p").await.unwrap();
+
+        // Delete the extracted module directory: still locked, but not present.
+        let install_path = config::modules_dir_in(tmp.path()).join("p");
+        std::fs::remove_dir_all(&install_path).unwrap();
+
+        let results = installer.verify().await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, VerificationStatus::ModuleMissing);
+    }
+
+    #[tokio::test]
+    async fn verify_reports_archive_unavailable_when_registry_lacks_package() {
+        let tmp = TempDir::new().unwrap();
+        config::write_manifest(tmp.path(), &Manifest::new("host")).unwrap();
+        let zip = make_zip(&[("p/lib.rs", b"v1")]);
+        let archive = tmp.path().join("p.zip");
+        std::fs::write(&archive, &zip).unwrap();
+        // Install with a registry that knows `p`...
+        let registry = MockRegistryClient::from_packages(vec![pkg_info("p", "1.0.0", &archive)]);
+        Installer::new(&registry, tmp.path().to_path_buf())
+            .install("p")
+            .await
+            .unwrap();
+
+        // ...but verify with a registry that has forgotten it. The module dir is
+        // present, so we reach — and fail — the archive-location step.
+        let empty = MockRegistryClient::from_packages(vec![]);
+        let installer = Installer::new(&empty, tmp.path().to_path_buf());
+        let results = installer.verify().await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(
+                results[0].status,
+                VerificationStatus::ArchiveUnavailable { .. }
+            ),
+            "got {:?}",
+            results[0].status
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_empty_when_nothing_installed() {
+        let tmp = TempDir::new().unwrap();
+        config::write_manifest(tmp.path(), &Manifest::new("host")).unwrap();
+        let registry = MockRegistryClient::from_packages(vec![]);
+        let installer = Installer::new(&registry, tmp.path().to_path_buf());
+        assert!(installer.verify().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn verify_not_a_project_errors() {
+        let tmp = TempDir::new().unwrap();
+        let registry = MockRegistryClient::from_packages(vec![]);
+        let installer = Installer::new(&registry, tmp.path().to_path_buf());
+        let err = installer.verify().await.unwrap_err();
+        assert!(matches!(err, InstallError::NotASmodProject { .. }));
     }
 }

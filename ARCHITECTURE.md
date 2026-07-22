@@ -141,8 +141,8 @@ command gains a flag.
 
 ### `src/commands/`
 One file per subcommand (`init`, `install`, `search`, `remove`, `list`,
-`publish`, `info`, `doctor`, `update`), registered in `commands/mod.rs`.
-Every file follows the same shape:
+`publish`, `info`, `doctor`, `update`, `verify`), registered in
+`commands/mod.rs`. Every file follows the same shape:
 
 ```rust
 #[derive(Args, Debug)]
@@ -158,10 +158,13 @@ pub async fn run(args: FooArgs) -> anyhow::Result<()> {
 `install.rs` and `list.rs` are the two commands with any real branching
 (single-package vs. batch install; declared-vs-installed status), and even
 there the branching is about *which business-logic call to make and how to
-render its result* — never new logic. `doctor`, `update`, and `publish`
-are intentionally-unimplemented stubs today; they `bail!` with a clear
-"not implemented yet" message (and a non-zero exit code) rather than
-silently no-op-ing.
+render its result* — never new logic. `doctor` and `verify` follow the same
+rule: their checking logic lives in the business layer (`doctor.rs` and
+`Installer::verify` respectively), and the command only formats the typed
+result and maps it to an exit code. `publish` remains an
+intentionally-unimplemented stub today; it `bail!`s with a clear "not
+implemented yet" message (and a non-zero exit code) rather than silently
+no-op-ing.
 
 ### `src/package.rs`
 The data model for `smod.toml`: the `Manifest` struct (`name`, `version`,
@@ -243,6 +246,23 @@ detail in [The install flow](#the-install-flow-walkthrough), but briefly:
   archive, checksum mismatch, invalid zip, extraction I/O failure,
   lockfile/manifest I/O failure, "not a smod project").
 
+### `src/doctor.rs`
+The business logic behind `smod doctor`: environment diagnostics. It returns a
+typed `DoctorReport { checks: Vec<DoctorCheck> }` (each `DoctorCheck` carries a
+`name`, a `CheckStatus`, and a `message`) rather than printing — rendering is
+`commands::doctor`'s job. It lives in its own module because a diagnostic is
+cross-cutting: it composes `config`'s project detection, `lockfile`'s reader,
+the `RegistryClient` abstraction, and `Installer::verify` (for the
+modules-present / archives-accessible / checksums-valid checks) instead of
+re-implementing any of them. `diagnose` never returns `Err` — every problem is
+captured as a failing check so the command can show the whole picture.
+
+Package integrity checking itself lives in `installer.rs` as
+`Installer::verify` (backing both `smod verify` and `doctor`'s checksum check),
+returning a `Vec<PackageVerification>`. It reuses the same `compute_checksum`
+and archive-reading path (`read_archive`) as `install`, so no checksum logic is
+duplicated.
+
 ### `src/ui/`
 Two tiny `indicatif` wrappers: `spinner::new(message)` (indeterminate,
 for "doing something that takes an unknown amount of time") and
@@ -268,8 +288,12 @@ commands::search     ─> registry
 commands::info        ─> registry
 commands::remove     ─> config, installer
 commands::list         ─> config, lockfile
-commands::{doctor,update,publish}  ─> (nothing yet - unimplemented stubs)
+commands::update      ─> config, installer, registry, ui
+commands::doctor      ─> doctor, registry
+commands::verify      ─> config, installer, registry, ui
+commands::publish     ─> (nothing yet - unimplemented stub)
 
+doctor     ─> config, lockfile, installer, registry
 installer  ─> config, lockfile, package, registry
 config       ─> package
 lockfile     ─> (nothing internal - self-contained)

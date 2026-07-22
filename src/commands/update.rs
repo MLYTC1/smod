@@ -16,6 +16,14 @@ use crate::ui;
 
 /// Arguments for `smod update`.
 #[derive(Args, Debug)]
+#[command(
+    long_about = "Update installed packages to the newest version the registry \
+                  offers. A package is only reinstalled when the registry has a \
+                  strictly newer version than what is installed.",
+    after_help = "Examples:\n  \
+        Update all installed packages:\n    smod update\n\n  \
+        Update just one package:\n    smod update payment-stream"
+)]
 pub struct UpdateArgs {
     /// A specific package to update. If omitted, all packages are updated.
     pub package: Option<String>,
