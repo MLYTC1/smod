@@ -119,14 +119,20 @@ pub struct InstalledPackage {
 }
 
 /// The outcome of installing one dependency during a batch `install_all`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// [`Failed`](DependencyOutcome::Failed) carries the original typed
+/// [`InstallError`] rather than a rendered string, so callers can still
+/// `match` on the exact failure reason. Rendering it for the user is the
+/// command layer's job. (This enum is therefore neither `Clone` nor `Eq`,
+/// because `InstallError` wraps non-clonable sources such as `io::Error`.)
+#[derive(Debug)]
 pub enum DependencyOutcome {
     /// Newly installed.
     Installed { name: String, version: String },
     /// Already present in `smod.lock`, so skipped.
     AlreadyInstalled { name: String, version: String },
     /// Failed to install; the batch continued past it.
-    Failed { name: String, error: String },
+    Failed { name: String, error: InstallError },
 }
 
 /// Installs and inspects packages against a given registry client and project
@@ -182,9 +188,14 @@ impl<'a, R: RegistryClient> Installer<'a, R> {
         let checksum = Self::compute_checksum(&bytes);
         self.verify_checksum(&info, &checksum)?;
 
-        // 7. Extract into smod_modules/<name>/.
-        let install_path = config::modules_dir_in(&self.project_root).join(&info.name);
-        self.extract_package(&bytes, &install_path)?;
+        // 7. Extract into a staging directory, then atomically swap it into
+        //    place. Extraction never writes directly into the final directory,
+        //    so a failed extraction can't leave partial files and a reinstall
+        //    can't leave stale files from an older version.
+        let modules_dir = config::modules_dir_in(&self.project_root);
+        let install_path = modules_dir.join(&info.name);
+        let staging_path = modules_dir.join(format!(".{}.tmp", info.name));
+        self.install_into_place(&bytes, &staging_path, &install_path)?;
 
         // 8. Record in the lockfile, then 9. add to the manifest.
         self.write_lockfile(&info, &checksum)?;
@@ -243,7 +254,7 @@ impl<'a, R: RegistryClient> Installer<'a, R> {
                 }),
                 Err(error) => outcomes.push(DependencyOutcome::Failed {
                     name: name.clone(),
-                    error: error.to_string(),
+                    error,
                 }),
             }
         }
@@ -383,6 +394,56 @@ impl<'a, R: RegistryClient> Installer<'a, R> {
         Ok(())
     }
 
+    /// Extract `bytes` into `staging`, then atomically move it into
+    /// `final_path`, making installation all-or-nothing.
+    ///
+    /// - Extraction always targets a fresh `staging` directory, never
+    ///   `final_path` directly.
+    /// - On **any** failure (extraction or swap), `staging` is removed and an
+    ///   existing `final_path` is left untouched.
+    /// - On success, the previous `final_path` (if any) is removed and
+    ///   `staging` is renamed onto it, so stale files from an older version
+    ///   never survive a reinstall.
+    fn install_into_place(
+        &self,
+        bytes: &[u8],
+        staging: &Path,
+        final_path: &Path,
+    ) -> Result<(), InstallError> {
+        // Clear any leftover staging directory from a previously interrupted
+        // run before extracting into it.
+        if staging.exists() {
+            std::fs::remove_dir_all(staging)
+                .map_err(|source| InstallError::ExtractIo { source })?;
+        }
+
+        // Extract into the staging directory; clean it up on failure.
+        if let Err(err) = self.extract_package(bytes, staging) {
+            let _ = std::fs::remove_dir_all(staging);
+            return Err(err);
+        }
+
+        // Swap the staging directory into its final location; clean it up on
+        // failure so a botched swap doesn't leave the staging dir behind.
+        if let Err(err) = Self::swap_into_place(staging, final_path) {
+            let _ = std::fs::remove_dir_all(staging);
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    /// Replace `final_path` with `staging`: remove the existing final directory
+    /// (if any), then rename `staging` onto it. The rename is atomic within the
+    /// same directory.
+    fn swap_into_place(staging: &Path, final_path: &Path) -> Result<(), InstallError> {
+        if final_path.exists() {
+            std::fs::remove_dir_all(final_path)
+                .map_err(|source| InstallError::ExtractIo { source })?;
+        }
+        std::fs::rename(staging, final_path).map_err(|source| InstallError::ExtractIo { source })
+    }
+
     /// Upsert the package into `smod.lock`.
     pub fn write_lockfile(&self, info: &PackageInfo, checksum: &str) -> Result<(), InstallError> {
         let mut lock = lockfile::read(&self.project_root)?;
@@ -504,6 +565,19 @@ mod tests {
         };
         let registry = MockRegistryClient::from_packages(vec![info]);
         (tmp, registry)
+    }
+
+    /// Build a `PackageInfo` pointing at an on-disk archive (no checksum).
+    fn pkg_info(name: &str, version: &str, archive: &Path) -> PackageInfo {
+        PackageInfo {
+            name: name.to_string(),
+            version: version.to_string(),
+            description: "d".into(),
+            author: "a".into(),
+            program_id: "p".into(),
+            archive: archive.to_string_lossy().to_string(),
+            checksum: None,
+        }
     }
 
     #[test]
@@ -701,6 +775,152 @@ mod tests {
         assert!(lockfile::read(tmp.path()).unwrap().get("pkg").is_none());
     }
 
+    // --- atomic installation --------------------------------------------
+
+    #[tokio::test]
+    async fn failed_extraction_leaves_no_temp_directory() {
+        // "a" is a file, but "a/b" needs "a" to be a directory: extraction
+        // creates the staging dir, writes "a", then fails writing "a/b".
+        let zip = make_zip(&[("a", b"x"), ("a/b", b"y")]);
+        let (tmp, registry) = scaffold("p", &zip, None);
+        let installer = Installer::new(&registry, tmp.path().to_path_buf());
+
+        let err = installer.install("p").await.unwrap_err();
+        assert!(matches!(err, InstallError::ExtractIo { .. }), "got {err:?}");
+
+        let modules = config::modules_dir_in(tmp.path());
+        assert!(
+            !modules.join(".p.tmp").exists(),
+            "staging directory must be cleaned up on failure"
+        );
+        assert!(
+            !modules.join("p").exists(),
+            "no partial final directory should exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_reinstall_does_not_corrupt_existing_installation() {
+        let tmp = TempDir::new().unwrap();
+        config::write_manifest(tmp.path(), &Manifest::new("host")).unwrap();
+
+        // Good v1 install.
+        let zip1 = make_zip(&[("p/keep.txt", b"keep")]);
+        let a1 = tmp.path().join("v1.zip");
+        std::fs::write(&a1, &zip1).unwrap();
+        let reg1 = MockRegistryClient::from_packages(vec![pkg_info("p", "1.0.0", &a1)]);
+        Installer::new(&reg1, tmp.path().to_path_buf())
+            .install("p")
+            .await
+            .unwrap();
+
+        let install_path = config::modules_dir_in(tmp.path()).join("p");
+        assert!(install_path.join("keep.txt").is_file());
+
+        // Failing reinstall: checksum mismatch (fails before the swap).
+        let zip2 = make_zip(&[("p/replace.txt", b"replace")]);
+        let a2 = tmp.path().join("v2.zip");
+        std::fs::write(&a2, &zip2).unwrap();
+        let mut bad = pkg_info("p", "2.0.0", &a2);
+        bad.checksum = Some("deadbeefdeadbeef".into());
+        let reg2 = MockRegistryClient::from_packages(vec![bad]);
+        let err = Installer::new(&reg2, tmp.path().to_path_buf())
+            .install("p")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, InstallError::ChecksumMismatch { .. }));
+
+        // The previous installation is completely intact.
+        assert!(install_path.join("keep.txt").is_file());
+        assert!(!install_path.join("replace.txt").exists());
+        assert!(!config::modules_dir_in(tmp.path()).join(".p.tmp").exists());
+        assert_eq!(
+            lockfile::read(tmp.path())
+                .unwrap()
+                .get("p")
+                .unwrap()
+                .version,
+            "1.0.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn reinstall_removes_stale_files() {
+        let tmp = TempDir::new().unwrap();
+        config::write_manifest(tmp.path(), &Manifest::new("host")).unwrap();
+        let install_path = config::modules_dir_in(tmp.path()).join("p");
+
+        // v1 ships old.txt + lib.rs.
+        let zip1 = make_zip(&[("p/old.txt", b"old"), ("p/lib.rs", b"v1")]);
+        let a1 = tmp.path().join("v1.zip");
+        std::fs::write(&a1, &zip1).unwrap();
+        let reg1 = MockRegistryClient::from_packages(vec![pkg_info("p", "1.0.0", &a1)]);
+        Installer::new(&reg1, tmp.path().to_path_buf())
+            .install("p")
+            .await
+            .unwrap();
+        assert!(install_path.join("old.txt").is_file());
+
+        // v2 drops old.txt and adds new.txt.
+        let zip2 = make_zip(&[("p/lib.rs", b"v2"), ("p/new.txt", b"new")]);
+        let a2 = tmp.path().join("v2.zip");
+        std::fs::write(&a2, &zip2).unwrap();
+        let reg2 = MockRegistryClient::from_packages(vec![pkg_info("p", "2.0.0", &a2)]);
+        Installer::new(&reg2, tmp.path().to_path_buf())
+            .install("p")
+            .await
+            .unwrap();
+
+        assert!(
+            !install_path.join("old.txt").exists(),
+            "stale file from v1 must be gone after reinstall"
+        );
+        assert!(install_path.join("new.txt").is_file());
+        assert!(!config::modules_dir_in(tmp.path()).join(".p.tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn successful_reinstall_replaces_package_contents() {
+        let tmp = TempDir::new().unwrap();
+        config::write_manifest(tmp.path(), &Manifest::new("host")).unwrap();
+        let install_path = config::modules_dir_in(tmp.path()).join("p");
+
+        let zip1 = make_zip(&[("p/lib.rs", b"v1")]);
+        let a1 = tmp.path().join("v1.zip");
+        std::fs::write(&a1, &zip1).unwrap();
+        let reg1 = MockRegistryClient::from_packages(vec![pkg_info("p", "1.0.0", &a1)]);
+        Installer::new(&reg1, tmp.path().to_path_buf())
+            .install("p")
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(install_path.join("lib.rs")).unwrap(),
+            "v1"
+        );
+
+        let zip2 = make_zip(&[("p/lib.rs", b"v2")]);
+        let a2 = tmp.path().join("v2.zip");
+        std::fs::write(&a2, &zip2).unwrap();
+        let reg2 = MockRegistryClient::from_packages(vec![pkg_info("p", "2.0.0", &a2)]);
+        Installer::new(&reg2, tmp.path().to_path_buf())
+            .install("p")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(install_path.join("lib.rs")).unwrap(),
+            "v2"
+        );
+        assert_eq!(
+            lockfile::read(tmp.path())
+                .unwrap()
+                .get("p")
+                .unwrap()
+                .version,
+            "2.0.0"
+        );
+    }
+
     #[tokio::test]
     async fn install_all_reports_per_dependency_outcomes() {
         // Two valid packages, declared as deps; one already locked.
@@ -762,17 +982,33 @@ mod tests {
         let installer = Installer::new(&registry, tmp.path().to_path_buf());
         let outcomes = installer.install_all().await.unwrap();
 
-        assert!(outcomes.contains(&DependencyOutcome::AlreadyInstalled {
-            name: "a".into(),
-            version: "1.0.0".into()
-        }));
-        assert!(outcomes.contains(&DependencyOutcome::Installed {
-            name: "b".into(),
-            version: "1.0.0".into()
-        }));
-        assert!(outcomes
+        assert!(outcomes.iter().any(|o| matches!(
+            o,
+            DependencyOutcome::AlreadyInstalled { name, version }
+                if name == "a" && version == "1.0.0"
+        )));
+        assert!(outcomes.iter().any(|o| matches!(
+            o,
+            DependencyOutcome::Installed { name, version }
+                if name == "b" && version == "1.0.0"
+        )));
+
+        // The failed outcome preserves the original typed `InstallError`, so a
+        // caller can match on the exact variant instead of parsing a string.
+        let failed = outcomes
             .iter()
-            .any(|o| matches!(o, DependencyOutcome::Failed { name, .. } if name == "c")));
+            .find(|o| matches!(o, DependencyOutcome::Failed { name, .. } if name == "c"))
+            .expect("`c` should have failed");
+        match failed {
+            DependencyOutcome::Failed { error, .. } => assert!(
+                matches!(
+                    error,
+                    InstallError::Registry(RegistryError::PackageNotFound { .. })
+                ),
+                "expected a typed registry error, got {error:?}"
+            ),
+            _ => unreachable!(),
+        }
     }
 
     #[tokio::test]
