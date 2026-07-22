@@ -57,6 +57,10 @@ smod list
 
 # Remove a package (deletes its module dir + lockfile + manifest entries)
 smod remove payment-stream
+
+# Update installed packages to the newest version the registry offers
+smod update              # all installed packages
+smod update payment-stream   # just one
 ```
 
 Global flags: `--no-color` disables colored output; `--verbose` is accepted
@@ -70,9 +74,9 @@ containing sample Solana modules: `payment-stream`, `token-vault`, `nft-mint`,
 
 ### Not yet implemented
 
-`smod publish`, `smod doctor`, and `smod update` are intentionally
-unimplemented today. They fail clearly with a non-zero exit code (rather than
-silently doing nothing) and explain what is needed to implement them.
+`smod publish` and `smod doctor` are intentionally unimplemented today. They
+fail clearly with a non-zero exit code (rather than silently doing nothing) and
+explain what is needed to implement them.
 
 ## Project layout
 

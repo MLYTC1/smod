@@ -135,6 +135,31 @@ pub enum DependencyOutcome {
     Failed { name: String, error: InstallError },
 }
 
+/// The outcome of considering one installed package for update during
+/// [`Installer::update`].
+///
+/// Mirrors [`DependencyOutcome`]: [`Failed`](UpdateOutcome::Failed) carries the
+/// original typed [`InstallError`] (a missing registry package, a checksum
+/// mismatch, a failed extraction) rather than a rendered string, so callers can
+/// still `match` on the exact reason. Rendering is the command layer's job.
+/// (Not `Clone`/`Eq` for the same reason `DependencyOutcome` isn't:
+/// `InstallError` wraps non-clonable sources such as `io::Error`.)
+#[derive(Debug)]
+pub enum UpdateOutcome {
+    /// The registry offered a strictly newer version and it was reinstalled.
+    Updated {
+        name: String,
+        from: String,
+        to: String,
+    },
+    /// The installed version already matches (or exceeds) the registry's, so
+    /// nothing was reinstalled.
+    UpToDate { name: String, version: String },
+    /// The update could not be completed; the batch continued past it. The
+    /// previous installation is left intact (reinstalls are atomic).
+    Failed { name: String, error: InstallError },
+}
+
 /// Installs and inspects packages against a given registry client and project
 /// root.
 pub struct Installer<'a, R: RegistryClient> {
@@ -260,6 +285,95 @@ impl<'a, R: RegistryClient> Installer<'a, R> {
         }
 
         Ok(outcomes)
+    }
+
+    /// Update installed packages to the newest version the registry offers.
+    ///
+    /// The set of candidates is read from `smod.lock` (the installed packages).
+    /// With `only = Some(name)`, only that installed package is considered;
+    /// with `only = None`, every locked package is. For each candidate the
+    /// registry is queried through the [`RegistryClient`] trait, its version is
+    /// compared against the locked one, and if the registry is strictly newer
+    /// the package is reinstalled by delegating to [`install_one`] — reusing
+    /// the exact verified, atomic install pipeline (checksum, zip-slip checks,
+    /// staged extraction + swap, lockfile and manifest updates). No install
+    /// logic is duplicated here.
+    ///
+    /// Like [`install_all`], a single package failing (missing from the
+    /// registry, checksum mismatch, extraction error) does not abort the batch:
+    /// it becomes an [`UpdateOutcome::Failed`] carrying the typed error, and the
+    /// prior installation is left intact because reinstalls are atomic. Only
+    /// project-level problems (no `smod.toml`, an unreadable `smod.lock`) fail
+    /// the whole call.
+    ///
+    /// [`install_one`]: Installer::install_one
+    /// [`install_all`]: Installer::install_all
+    pub async fn update(&self, only: Option<&str>) -> Result<Vec<UpdateOutcome>, InstallError> {
+        if !config::is_smod_project(&self.project_root) {
+            return Err(InstallError::NotASmodProject {
+                path: self.project_root.clone(),
+            });
+        }
+
+        let lock = lockfile::read(&self.project_root)?;
+
+        // Snapshot the (name, installed version) pairs up front. Reinstalling a
+        // package mid-loop rewrites `smod.lock`, so iterating a snapshot rather
+        // than the live file keeps the loop stable.
+        let targets: Vec<(String, String)> = lock
+            .packages
+            .iter()
+            .filter(|p| match only {
+                Some(name) => p.name == name,
+                None => true,
+            })
+            .map(|p| (p.name.clone(), p.version.clone()))
+            .collect();
+
+        let mut outcomes = Vec::with_capacity(targets.len());
+        for (name, installed_version) in targets {
+            outcomes.push(self.update_one(&name, &installed_version).await);
+        }
+        Ok(outcomes)
+    }
+
+    /// Consider a single installed package for update, producing an
+    /// [`UpdateOutcome`]. Never aborts the batch — every failure mode is folded
+    /// into [`UpdateOutcome::Failed`] with its typed error preserved.
+    async fn update_one(&self, name: &str, installed_version: &str) -> UpdateOutcome {
+        // Query the registry through the trait seam — never a concrete client.
+        let available = match self.registry.get_package(name).await {
+            Ok(info) => info,
+            Err(source) => {
+                return UpdateOutcome::Failed {
+                    name: name.to_string(),
+                    error: InstallError::Registry(source),
+                };
+            }
+        };
+
+        // Only a *strictly newer* registry version counts as outdated.
+        if package::compare_versions(&available.version, installed_version)
+            != std::cmp::Ordering::Greater
+        {
+            return UpdateOutcome::UpToDate {
+                name: name.to_string(),
+                version: installed_version.to_string(),
+            };
+        }
+
+        // Outdated: reuse the full install pipeline to reinstall atomically.
+        match self.install_one(name).await {
+            Ok(installed) => UpdateOutcome::Updated {
+                name: name.to_string(),
+                from: installed_version.to_string(),
+                to: installed.info.version,
+            },
+            Err(error) => UpdateOutcome::Failed {
+                name: name.to_string(),
+                error,
+            },
+        }
     }
 
     /// Resolve `PackageInfo::archive` to an absolute filesystem path.
@@ -1109,5 +1223,309 @@ mod tests {
         let installer = Installer::new(&registry, tmp.path().to_path_buf());
         let installed = installer.install("my_module").await.unwrap();
         assert!(installed.install_path.join("lib.rs").is_file());
+    }
+
+    // --- update ---------------------------------------------------------
+
+    /// Install `name` at `version` from an in-memory zip, returning the temp
+    /// project so the test can then point a new registry at a newer archive.
+    async fn install_v(tmp: &TempDir, name: &str, version: &str, contents: &[u8]) {
+        let zip = make_zip(&[(&format!("{name}/lib.rs"), contents)]);
+        let archive = tmp.path().join(format!("{name}-{version}.zip"));
+        std::fs::write(&archive, &zip).unwrap();
+        let registry = MockRegistryClient::from_packages(vec![pkg_info(name, version, &archive)]);
+        Installer::new(&registry, tmp.path().to_path_buf())
+            .install(name)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_replaces_outdated_package() {
+        let tmp = TempDir::new().unwrap();
+        config::write_manifest(tmp.path(), &Manifest::new("host")).unwrap();
+        let install_path = config::modules_dir_in(tmp.path()).join("payment-stream");
+
+        // Installed: payment-stream 1.0.0.
+        install_v(&tmp, "payment-stream", "1.0.0", b"v1").await;
+        let checksum_v1 = lockfile::read(tmp.path())
+            .unwrap()
+            .get("payment-stream")
+            .unwrap()
+            .checksum
+            .clone();
+
+        // Registry: payment-stream 1.1.0 (a different archive).
+        let zip2 = make_zip(&[("payment-stream/lib.rs", b"v2")]);
+        let a2 = tmp.path().join("payment-stream-1.1.0.zip");
+        std::fs::write(&a2, &zip2).unwrap();
+        let registry =
+            MockRegistryClient::from_packages(vec![pkg_info("payment-stream", "1.1.0", &a2)]);
+        let installer = Installer::new(&registry, tmp.path().to_path_buf());
+
+        let outcomes = installer.update(None).await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(
+                &outcomes[0],
+                UpdateOutcome::Updated { name, from, to }
+                    if name == "payment-stream" && from == "1.0.0" && to == "1.1.0"
+            ),
+            "got {:?}",
+            outcomes[0]
+        );
+
+        // Lockfile carries the new version and a new checksum.
+        let lock = lockfile::read(tmp.path()).unwrap();
+        let locked = lock.get("payment-stream").unwrap();
+        assert_eq!(locked.version, "1.1.0");
+        assert_ne!(locked.checksum, checksum_v1, "checksum must be updated");
+
+        // The extracted contents were replaced.
+        assert_eq!(
+            std::fs::read_to_string(install_path.join("lib.rs")).unwrap(),
+            "v2"
+        );
+
+        // The manifest dependency was bumped too.
+        let deps = config::list_dependencies(tmp.path()).unwrap();
+        assert_eq!(
+            deps.get("payment-stream").map(String::as_str),
+            Some("1.1.0")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_up_to_date_does_not_reinstall() {
+        let tmp = TempDir::new().unwrap();
+        config::write_manifest(tmp.path(), &Manifest::new("host")).unwrap();
+
+        install_v(&tmp, "p", "1.0.0", b"v1").await;
+
+        // Stamp a sentinel `installed_at`; a reinstall would overwrite it.
+        let mut lock = lockfile::read(tmp.path()).unwrap();
+        let mut locked = lock.get("p").unwrap().clone();
+        locked.installed_at = "1970-01-01T00:00:00Z".to_string();
+        lock.upsert(locked);
+        lockfile::write(tmp.path(), &lock).unwrap();
+
+        // Registry offers the *same* version 1.0.0 — nothing to do.
+        let archive = tmp.path().join("p-1.0.0.zip");
+        let registry = MockRegistryClient::from_packages(vec![pkg_info("p", "1.0.0", &archive)]);
+        let installer = Installer::new(&registry, tmp.path().to_path_buf());
+
+        let outcomes = installer.update(None).await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(
+                &outcomes[0],
+                UpdateOutcome::UpToDate { name, version }
+                    if name == "p" && version == "1.0.0"
+            ),
+            "got {:?}",
+            outcomes[0]
+        );
+
+        // The sentinel timestamp survives: no reinstall happened.
+        let after = lockfile::read(tmp.path()).unwrap();
+        assert_eq!(after.get("p").unwrap().installed_at, "1970-01-01T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn update_missing_registry_package_is_typed_error() {
+        let tmp = TempDir::new().unwrap();
+        config::write_manifest(tmp.path(), &Manifest::new("host")).unwrap();
+
+        // A locked package the registry knows nothing about.
+        let mut lock = lockfile::Lockfile::default();
+        lock.upsert(LockedPackage {
+            name: "ghost".into(),
+            version: "1.0.0".into(),
+            checksum: "x".into(),
+            installed_at: "1970-01-01T00:00:00Z".into(),
+        });
+        lockfile::write(tmp.path(), &lock).unwrap();
+
+        let registry = MockRegistryClient::from_packages(vec![]);
+        let installer = Installer::new(&registry, tmp.path().to_path_buf());
+
+        let outcomes = installer.update(None).await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            UpdateOutcome::Failed { name, error } => {
+                assert_eq!(name, "ghost");
+                assert!(
+                    matches!(
+                        error,
+                        InstallError::Registry(RegistryError::PackageNotFound { .. })
+                    ),
+                    "expected a typed registry error, got {error:?}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_failed_checksum_keeps_existing_installation_safe() {
+        let tmp = TempDir::new().unwrap();
+        config::write_manifest(tmp.path(), &Manifest::new("host")).unwrap();
+        let install_path = config::modules_dir_in(tmp.path()).join("p");
+
+        // Good v1 install.
+        install_v(&tmp, "p", "1.0.0", b"v1").await;
+        assert_eq!(
+            std::fs::read_to_string(install_path.join("lib.rs")).unwrap(),
+            "v1"
+        );
+
+        // Registry offers 2.0.0 but with a checksum that won't match — the
+        // reinstall must fail before touching the existing install.
+        let zip2 = make_zip(&[("p/lib.rs", b"v2")]);
+        let a2 = tmp.path().join("p-2.0.0.zip");
+        std::fs::write(&a2, &zip2).unwrap();
+        let mut bad = pkg_info("p", "2.0.0", &a2);
+        bad.checksum = Some("deadbeefdeadbeef".into());
+        let registry = MockRegistryClient::from_packages(vec![bad]);
+        let installer = Installer::new(&registry, tmp.path().to_path_buf());
+
+        let outcomes = installer.update(None).await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            UpdateOutcome::Failed { name, error } => {
+                assert_eq!(name, "p");
+                assert!(
+                    matches!(error, InstallError::ChecksumMismatch { .. }),
+                    "got {error:?}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        // The previous installation is completely intact.
+        assert_eq!(
+            std::fs::read_to_string(install_path.join("lib.rs")).unwrap(),
+            "v1"
+        );
+        assert!(!config::modules_dir_in(tmp.path()).join(".p.tmp").exists());
+        assert_eq!(
+            lockfile::read(tmp.path())
+                .unwrap()
+                .get("p")
+                .unwrap()
+                .version,
+            "1.0.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_multiple_dependencies_reports_each() {
+        let tmp = TempDir::new().unwrap();
+        config::write_manifest(tmp.path(), &Manifest::new("host")).unwrap();
+
+        // Installed: `a` 1.0.0 (will be outdated) and `b` 1.0.0 (stays current).
+        install_v(&tmp, "a", "1.0.0", b"a-v1").await;
+        install_v(&tmp, "b", "1.0.0", b"b-v1").await;
+
+        // Also locked: `c`, which the registry doesn't know about.
+        let mut lock = lockfile::read(tmp.path()).unwrap();
+        lock.upsert(LockedPackage {
+            name: "c".into(),
+            version: "1.0.0".into(),
+            checksum: "x".into(),
+            installed_at: "1970-01-01T00:00:00Z".into(),
+        });
+        lockfile::write(tmp.path(), &lock).unwrap();
+
+        // Registry: `a` 1.1.0 (newer), `b` 1.0.0 (same), no `c`.
+        let zip_a2 = make_zip(&[("a/lib.rs", b"a-v2")]);
+        let a2 = tmp.path().join("a-1.1.0.zip");
+        std::fs::write(&a2, &zip_a2).unwrap();
+        let b_archive = tmp.path().join("b-1.0.0.zip");
+        let registry = MockRegistryClient::from_packages(vec![
+            pkg_info("a", "1.1.0", &a2),
+            pkg_info("b", "1.0.0", &b_archive),
+        ]);
+        let installer = Installer::new(&registry, tmp.path().to_path_buf());
+
+        let outcomes = installer.update(None).await.unwrap();
+        assert_eq!(outcomes.len(), 3);
+
+        assert!(
+            outcomes.iter().any(|o| matches!(
+                o,
+                UpdateOutcome::Updated { name, from, to }
+                    if name == "a" && from == "1.0.0" && to == "1.1.0"
+            )),
+            "expected `a` to be Updated, got {outcomes:?}"
+        );
+        assert!(
+            outcomes.iter().any(|o| matches!(
+                o,
+                UpdateOutcome::UpToDate { name, version }
+                    if name == "b" && version == "1.0.0"
+            )),
+            "expected `b` to be UpToDate, got {outcomes:?}"
+        );
+        let c_failed = outcomes
+            .iter()
+            .find(|o| matches!(o, UpdateOutcome::Failed { name, .. } if name == "c"))
+            .expect("`c` should have failed");
+        match c_failed {
+            UpdateOutcome::Failed { error, .. } => assert!(
+                matches!(
+                    error,
+                    InstallError::Registry(RegistryError::PackageNotFound { .. })
+                ),
+                "expected a typed registry error, got {error:?}"
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_not_a_project_errors() {
+        let tmp = TempDir::new().unwrap();
+        // No manifest -> not a project.
+        let registry = MockRegistryClient::from_packages(vec![]);
+        let installer = Installer::new(&registry, tmp.path().to_path_buf());
+        let err = installer.update(None).await.unwrap_err();
+        assert!(matches!(err, InstallError::NotASmodProject { .. }));
+    }
+
+    #[tokio::test]
+    async fn update_targeted_only_touches_requested_package() {
+        let tmp = TempDir::new().unwrap();
+        config::write_manifest(tmp.path(), &Manifest::new("host")).unwrap();
+
+        install_v(&tmp, "a", "1.0.0", b"a-v1").await;
+        install_v(&tmp, "b", "1.0.0", b"b-v1").await;
+
+        // Registry has newer versions for both, but we only ask for `a`.
+        let zip_a2 = make_zip(&[("a/lib.rs", b"a-v2")]);
+        let a2 = tmp.path().join("a-1.1.0.zip");
+        std::fs::write(&a2, &zip_a2).unwrap();
+        let zip_b2 = make_zip(&[("b/lib.rs", b"b-v2")]);
+        let b2 = tmp.path().join("b-1.1.0.zip");
+        std::fs::write(&b2, &zip_b2).unwrap();
+        let registry = MockRegistryClient::from_packages(vec![
+            pkg_info("a", "1.1.0", &a2),
+            pkg_info("b", "1.1.0", &b2),
+        ]);
+        let installer = Installer::new(&registry, tmp.path().to_path_buf());
+
+        let outcomes = installer.update(Some("a")).await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(&outcomes[0], UpdateOutcome::Updated { name, .. } if name == "a"));
+
+        // `b` was left at its installed version.
+        assert_eq!(
+            lockfile::read(tmp.path())
+                .unwrap()
+                .get("b")
+                .unwrap()
+                .version,
+            "1.0.0"
+        );
     }
 }

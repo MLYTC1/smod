@@ -6,6 +6,7 @@
 //! here is defining the manifest schema and the single place where manifest
 //! TOML (de)serialization happens.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -63,6 +64,42 @@ pub fn validate_package_name(name: &str) -> Result<(), PackageNameError> {
         }
     }
     Ok(())
+}
+
+/// Compare two dotted version strings (e.g. `1.0.0` vs `1.1.0`).
+///
+/// This is the smallest correct version ordering `smod` needs today: versions
+/// are compared component-by-component after splitting on `.`, numerically when
+/// both components parse as integers, and lexically as a conservative fallback
+/// otherwise. Missing trailing components are treated as `0`, so `1.2` and
+/// `1.2.0` compare equal.
+///
+/// It deliberately does *not* pull in a full semver crate or introduce a
+/// `Version` type — package versions remain plain strings in the manifest,
+/// lockfile, and registry. `update` uses this to decide whether the registry
+/// offers a strictly newer version than what is installed.
+pub fn compare_versions(a: &str, b: &str) -> Ordering {
+    let mut a_parts = a.split('.');
+    let mut b_parts = b.split('.');
+    loop {
+        match (a_parts.next(), b_parts.next()) {
+            (None, None) => return Ordering::Equal,
+            (a_part, b_part) => {
+                // A missing component (one version has fewer parts) is treated
+                // as `0`, so `1.2` == `1.2.0`.
+                let a_str = a_part.unwrap_or("0");
+                let b_str = b_part.unwrap_or("0");
+                let ordering = match (a_str.parse::<u64>(), b_str.parse::<u64>()) {
+                    (Ok(a_num), Ok(b_num)) => a_num.cmp(&b_num),
+                    // Non-numeric component: fall back to a byte-wise compare.
+                    _ => a_str.cmp(b_str),
+                };
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+            }
+        }
+    }
 }
 
 /// A project's own description of itself, as stored in `smod.toml`.
@@ -269,5 +306,40 @@ mod tests {
         for name in ["with space", "tab\there", "null\0byte"] {
             assert!(validate_package_name(name).is_err());
         }
+    }
+
+    // --- version comparison ---------------------------------------------
+
+    #[test]
+    fn compare_versions_orders_by_component() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_versions("1.1.0", "1.0.0"), Ordering::Greater);
+        assert_eq!(compare_versions("1.0.0", "1.1.0"), Ordering::Less);
+        assert_eq!(compare_versions("2.0.0", "1.9.9"), Ordering::Greater);
+        assert_eq!(compare_versions("1.0.0", "1.0.0"), Ordering::Equal);
+    }
+
+    #[test]
+    fn compare_versions_treats_missing_components_as_zero() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_versions("1.2", "1.2.0"), Ordering::Equal);
+        assert_eq!(compare_versions("1.2.1", "1.2"), Ordering::Greater);
+    }
+
+    #[test]
+    fn compare_versions_numeric_not_lexical() {
+        use std::cmp::Ordering;
+        // Lexically "10" < "9"; numerically 10 > 9.
+        assert_eq!(compare_versions("1.10.0", "1.9.0"), Ordering::Greater);
+    }
+
+    #[test]
+    fn compare_versions_falls_back_to_lexical_for_non_numeric() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_versions("1.0.0", "1.0.0-beta"), Ordering::Less);
+        assert_eq!(
+            compare_versions("1.0.0-rc2", "1.0.0-rc1"),
+            Ordering::Greater
+        );
     }
 }
