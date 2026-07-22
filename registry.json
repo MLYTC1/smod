@@ -7,7 +7,10 @@
       "author": "smod-labs",
       "program_id": "Pay1nStrEamProgram11111111111111111111111",
       "archive": "./packages/payment-stream.zip",
-      "checksum": "6e05f44ac0624b38c98975ada5484a15b1373e7270cc8f0aca12de094fca06c3"
+      "checksum": "6e05f44ac0624b38c98975ada5484a15b1373e7270cc8f0aca12de094fca06c3",
+      "dependencies": {
+        "token-vault": ">=2.0.0"
+      }
     },
     {
       "name": "token-vault",

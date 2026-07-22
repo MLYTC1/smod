@@ -276,6 +276,7 @@ mod tests {
             program_id: "p".into(),
             archive: archive.to_string_lossy().to_string(),
             checksum: None,
+            dependencies: Default::default(),
         }
     }
 

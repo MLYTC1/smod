@@ -125,7 +125,7 @@ Why this shape specifically:
 ### `src/main.rs`
 The entire binary entry point. Parses `Cli::parse()`, applies `--no-color`,
 and `match`es `cli.command` to the right `commands::*::run(args).await`.
-That `match` (`dispatch`) is the *only* place that knows all nine
+That `match` (`dispatch`) is the *only* place that knows all the
 subcommands exist. If `dispatch` returns `Err`, `main` prints
 `error: {rendered chain}` in red and exits `1`. There is no logic here
 beyond that — deliberately, so nothing about "how installing works" is
@@ -140,9 +140,12 @@ keeps `cli.rs` from becoming a second place you need to edit every time a
 command gains a flag.
 
 ### `src/commands/`
-One file per subcommand (`init`, `install`, `search`, `remove`, `list`,
-`publish`, `info`, `doctor`, `update`, `verify`), registered in
-`commands/mod.rs`. Every file follows the same shape:
+One file per subcommand (`new`, `init`, `install`, `search`, `remove`,
+`list`, `publish`, `info`, `doctor`, `update`, `verify`), registered in
+`commands/mod.rs`. That module root also defines one shared, reusable
+`OutputArgs` (`--json`), flattened into the commands that support
+machine-readable output (`list`, `search`, `info`) so the flag is defined
+once rather than repeated per command. Every file follows the same shape:
 
 ```rust
 #[derive(Args, Debug)]
@@ -161,10 +164,20 @@ there the branching is about *which business-logic call to make and how to
 render its result* — never new logic. `doctor` and `verify` follow the same
 rule: their checking logic lives in the business layer (`doctor.rs` and
 `Installer::verify` respectively), and the command only formats the typed
-result and maps it to an exit code. `publish` remains an
-intentionally-unimplemented stub today; it `bail!`s with a clear "not
-implemented yet" message (and a non-zero exit code) rather than silently
-no-op-ing.
+result and maps it to an exit code. `new` follows it too: all project
+generation lives in `scaffold.rs`, and the command only prints the files it
+was told were created. `publish` remains an intentionally-unimplemented stub
+today; it `bail!`s with a clear "not implemented yet" message (and a non-zero
+exit code) rather than silently no-op-ing.
+
+Presentation decisions — an aligned table vs. a labeled block, human text vs.
+`--json`, staged progress lines — are all made here in the command layer.
+`search`, `info`, and `list` branch on `OutputArgs::json` to either serialize
+the business-layer data structure directly (`ui::json`) or render it for a
+human (`ui::table` for `search`, labeled fields for `info`). `install`'s
+single-package path renders `Installer`'s `InstallStage` progress callbacks
+(resolving → verifying → extracting → updating lockfile); the installer reports
+each stage, the command decides how to show it.
 
 ### `src/package.rs`
 The data model for `smod.toml`: the `Manifest` struct (`name`, `version`,
@@ -174,6 +187,15 @@ a `BTreeMap<String, String>` (sorted, so the file diffs predictably).
 `Manifest::to_toml_string` / `from_toml_str` are the only place TOML
 (de)serialization happens for the manifest. Nothing in this file touches
 the filesystem — that's `config.rs`'s job.
+
+Two pure version helpers also live here, since versions are plain strings in
+the manifest/lockfile/registry: `compare_versions` (component-wise ordering)
+and `VersionReq` — a small parser + matcher for the subset of requirement
+syntax `smod` needs (`1.2.3` exact, `>=1.0.0` minimum, `^1.0` caret). This is
+deliberately *not* a full semver crate; it is built on `compare_versions` and
+kept in the data-model layer so requirement resolution never leaks into a
+command (`commands::list` calls it to report whether an installed version
+satisfies its declared requirement).
 
 ### `src/config.rs`
 The filesystem boundary for `smod.toml`. Three groups of functions:
@@ -246,6 +268,17 @@ detail in [The install flow](#the-install-flow-walkthrough), but briefly:
   archive, checksum mismatch, invalid zip, extraction I/O failure,
   lockfile/manifest I/O failure, "not a smod project").
 
+### `src/scaffold.rs`
+The business logic behind `smod new`: generating a new project directory tree
+(`smod.toml`, `src/lib.rs`, `README.md`). `create_project` validates the name
+through the same `validate_package_name` gate everything else uses, refuses to
+overwrite an existing destination, and returns a typed `CreatedProject`
+(root + created file paths) or a `NewProjectError` — it never prints. It
+*reuses* `package::Manifest` + `config::write_manifest` rather than
+reimplementing manifest serialization, so `smod.toml` is generated exactly one
+way. It lives in its own module (rather than in `config.rs`) because it does
+more than the manifest boundary: it creates a subtree and writes several files.
+
 ### `src/doctor.rs`
 The business logic behind `smod doctor`: environment diagnostics. It returns a
 typed `DoctorReport { checks: Vec<DoctorCheck> }` (each `DoctorCheck` carries a
@@ -264,12 +297,14 @@ and archive-reading path (`read_archive`) as `install`, so no checksum logic is
 duplicated.
 
 ### `src/ui/`
-Two tiny `indicatif` wrappers: `spinner::new(message)` (indeterminate,
-for "doing something that takes an unknown amount of time") and
-`progress::new(total)` (a determinate byte-progress bar, styled and ready
-for the day archive downloads are actually streamed over HTTP — currently
-unused for that reason, and that's fine). Nothing here does any work;
-these are purely cosmetic and only ever touched by `commands/*.rs`.
+Presentation helpers, only ever touched by `commands/*.rs` and never by
+business logic. Two tiny `indicatif` wrappers — `spinner::new(message)`
+(indeterminate) and `progress::new(total)` (a determinate byte-progress bar,
+styled and ready for streamed HTTP downloads, currently unused and that's
+fine) — plus two output helpers: `table::render(headers, rows)` (fixed-width
+aligned columns as plain text, so column widths aren't thrown off by ANSI
+codes) and `json::print(value)` (pretty-prints any `Serialize` value to
+stdout). Nothing here does real work; it only formats what a command hands it.
 
 ---
 
@@ -280,27 +315,29 @@ Arrows mean "imports / calls into," i.e. "depends on":
 ```
 main.rs
   └─> cli.rs
-  └─> commands::{init,install,search,remove,list,publish,info,doctor,update}
+  └─> commands::{new,init,install,search,remove,list,publish,info,doctor,update,verify}
 
-commands::init      ─> config, package, ui
+commands::new        ─> scaffold
+commands::init       ─> config, package, ui
 commands::install    ─> config, installer, registry, ui
-commands::search     ─> registry
-commands::info        ─> registry
+commands::search     ─> registry, ui
+commands::info       ─> registry, ui
 commands::remove     ─> config, installer
-commands::list         ─> config, lockfile
-commands::update      ─> config, installer, registry, ui
-commands::doctor      ─> doctor, registry
-commands::verify      ─> config, installer, registry, ui
-commands::publish     ─> (nothing yet - unimplemented stub)
+commands::list       ─> config, lockfile, package, ui
+commands::update     ─> config, installer, registry, ui
+commands::doctor     ─> doctor, registry
+commands::verify     ─> config, installer, registry, ui
+commands::publish    ─> (nothing yet - unimplemented stub)
 
+scaffold   ─> config, package
 doctor     ─> config, lockfile, installer, registry
 installer  ─> config, lockfile, package, registry
 config       ─> package
-lockfile     ─> (nothing internal - self-contained)
+lockfile     ─> package (only the shared validate_package_name gate)
 registry     ─> (nothing internal - self-contained)
 package      ─> (nothing internal - leaf module)
 
-ui  ─> (nothing internal - leaf module, only external indicatif)
+ui  ─> (nothing internal - leaf module; external indicatif + serde_json)
 ```
 
 Two things worth noticing:
@@ -328,8 +365,12 @@ end-to-end. Two entry points converge on the same pipeline:
   `Installer::install_all`, which calls `Installer::install_one` once per
   undeclared-as-installed dependency
 
-Either way, `Installer::install(package_query)` runs these steps in order,
-returning at the first failure:
+`Installer::install` is a thin wrapper over `install_with_progress`, which
+takes a `&mut dyn FnMut(InstallStage)` callback and invokes it as each stage is
+entered (`Resolving` → `Verifying` → `Extracting` → `UpdatingLockfile`). This
+is how `commands::install` renders staged progress without the installer ever
+printing; `install` itself just passes a no-op closure. Either way, the same
+steps run in order, returning at the first failure:
 
 ```
  1. config::is_smod_project(project_root)?          -> InstallError::NotASmodProject
@@ -440,11 +481,14 @@ file:
     `registry.json` happens to be in the directory you're standing in."
 
 `PackageInfo` (`name`, `version`, `description`, `author`, `program_id`,
-`archive`, `checksum: Option<String>`) is the registry's view of a
-package — kept distinct from `package::Manifest`, which is a *project's
-own* description of itself before it's published. They will diverge more
-once `publish` exists (a manifest doesn't need to carry a checksum of
-itself, for instance).
+`archive`, `checksum: Option<String>`, `dependencies: BTreeMap<String,
+String>`) is the registry's view of a package — kept distinct from
+`package::Manifest`, which is a *project's own* description of itself before
+it's published. They will diverge more once `publish` exists (a manifest
+doesn't need to carry a checksum of itself, for instance). `dependencies` is
+registry metadata surfaced by `smod info`; it defaults to empty (older
+registry documents deserialize unchanged) and does not yet drive transitive
+installation.
 
 ---
 
@@ -531,12 +575,14 @@ Two error styles are used on purpose, at two different layers:
 
 ## Testing strategy
 
-Tests live next to the code they test, in a `#[cfg(test)] mod tests`
-block at the bottom of each file — there's no separate `tests/`
-integration directory yet (see
-[Known limitations](#known-limitations--things-a-contributor-should-know)).
-As of this writing there are 71 tests. A few patterns worth following if
-you're adding more:
+Most tests live next to the code they test, in a `#[cfg(test)] mod tests`
+block at the bottom of each file. These are the fast, precise unit tests that
+assert on typed results rather than printed text. In addition, `tests/cli.rs`
+holds end-to-end integration tests that spawn the compiled `smod` binary in a
+temp directory and assert on its stdout/stderr and exit code — exercising the
+full stack (arg parsing, dispatch, the embedded registry, the real
+`packages/*.zip`, and on-disk `smod.toml`/`smod.lock`) the way a user would.
+A few patterns worth following if you're adding more:
 
 - **Business logic tests never touch `commands/`.** They construct a
   `MockRegistryClient::from_json_str(...)` pointed at a `tempfile`

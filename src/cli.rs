@@ -42,6 +42,8 @@ pub struct Cli {
 /// One variant per subcommand.
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Create a new smod project in a new directory.
+    New(commands::new::NewArgs),
     /// Create a new smod project in the current directory.
     Init(commands::init::InitArgs),
     /// Install one package, or every declared dependency.

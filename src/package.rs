@@ -102,6 +102,130 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
     }
 }
 
+/// Error returned when a dependency version requirement cannot be parsed.
+///
+/// Kept intentionally small: `smod` supports only the subset of requirement
+/// syntax it actually needs (see [`VersionReq`]), so the only ways to be
+/// invalid are being empty or not being a dotted numeric version after the
+/// (optional) operator.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum VersionReqError {
+    /// The requirement string was empty (or only whitespace).
+    #[error("version requirement must not be empty")]
+    Empty,
+
+    /// The requirement was not a supported operator followed by a dotted
+    /// numeric version (e.g. `>=1.0.0`, `^1.0`, `1.2.3`).
+    #[error("invalid version requirement `{0}` (expected e.g. `1.2.3`, `>=1.0.0`, or `^1.0`)")]
+    Invalid(String),
+}
+
+/// A parsed dependency version requirement.
+///
+/// This is the smallest useful subset of semver-style requirements `smod`
+/// needs, built on top of [`compare_versions`] rather than pulling in a full
+/// semver crate. Three shapes are supported:
+///
+/// - `"1.2.3"` (or `"=1.2.3"`) — [`Exact`](VersionReq::Exact): the version must
+///   compare equal (so `1.2` and `1.2.0` are equal, per [`compare_versions`]).
+/// - `">=1.0.0"` — [`AtLeast`](VersionReq::AtLeast): the version must be greater
+///   than or equal to the bound.
+/// - `"^1.0"` — [`Caret`](VersionReq::Caret): the version must be at least the
+///   bound and below the next incompatible release, where "incompatible" is
+///   determined by the left-most non-zero component (`^1.0` allows `>=1.0.0,
+///   <2.0.0`; `^0.2.3` allows `>=0.2.3, <0.3.0`).
+///
+/// Resolution lives here in the data-model layer, never in a command: a command
+/// parses a requirement and asks whether a concrete version satisfies it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionReq {
+    /// The version must equal this one exactly.
+    Exact(String),
+    /// The version must be greater than or equal to this one.
+    AtLeast(String),
+    /// The version must be caret-compatible with this one.
+    Caret(String),
+}
+
+impl VersionReq {
+    /// Parse a requirement string into a [`VersionReq`].
+    ///
+    /// Leading/trailing whitespace (and whitespace after the operator) is
+    /// ignored. Only the operators documented on [`VersionReq`] are supported;
+    /// anything else — an empty string, an unknown operator, or a non-numeric
+    /// version — is a [`VersionReqError`].
+    pub fn parse(input: &str) -> Result<Self, VersionReqError> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Err(VersionReqError::Empty);
+        }
+
+        let (make, version): (fn(String) -> VersionReq, &str) =
+            if let Some(rest) = trimmed.strip_prefix(">=") {
+                (VersionReq::AtLeast, rest)
+            } else if let Some(rest) = trimmed.strip_prefix('^') {
+                (VersionReq::Caret, rest)
+            } else if let Some(rest) = trimmed.strip_prefix('=') {
+                (VersionReq::Exact, rest)
+            } else {
+                (VersionReq::Exact, trimmed)
+            };
+
+        let version = version.trim();
+        Self::require_numeric_version(version, trimmed)?;
+        Ok(make(version.to_string()))
+    }
+
+    /// Whether `version` satisfies this requirement.
+    pub fn matches(&self, version: &str) -> bool {
+        match self {
+            VersionReq::Exact(bound) => compare_versions(version, bound) == Ordering::Equal,
+            VersionReq::AtLeast(bound) => compare_versions(version, bound) != Ordering::Less,
+            VersionReq::Caret(bound) => {
+                // At least the bound, and strictly below the next incompatible
+                // release.
+                compare_versions(version, bound) != Ordering::Less
+                    && compare_versions(version, &caret_upper_bound(bound)) == Ordering::Less
+            }
+        }
+    }
+
+    /// Validate that `version` is a non-empty, dotted, all-numeric version.
+    ///
+    /// `original` is the full requirement string (operator included) so the
+    /// error message points at what the user actually wrote.
+    fn require_numeric_version(version: &str, original: &str) -> Result<(), VersionReqError> {
+        if version.is_empty() {
+            return Err(VersionReqError::Invalid(original.to_string()));
+        }
+        for part in version.split('.') {
+            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(VersionReqError::Invalid(original.to_string()));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The exclusive upper bound for a caret requirement: the next version that is
+/// considered incompatible, per the left-most non-zero component.
+///
+/// `base` is assumed already validated as a dotted numeric version (as
+/// guaranteed by [`VersionReq::parse`]), so component parsing cannot fail.
+fn caret_upper_bound(base: &str) -> String {
+    let parts: Vec<u64> = base.split('.').map(|p| p.parse().unwrap_or(0)).collect();
+    let major = parts.first().copied().unwrap_or(0);
+    let minor = parts.get(1).copied().unwrap_or(0);
+    let patch = parts.get(2).copied().unwrap_or(0);
+    if major > 0 {
+        format!("{}.0.0", major + 1)
+    } else if minor > 0 {
+        format!("0.{}.0", minor + 1)
+    } else {
+        format!("0.0.{}", patch + 1)
+    }
+}
+
 /// A project's own description of itself, as stored in `smod.toml`.
 ///
 /// This is deliberately kept distinct from [`crate::registry::PackageInfo`]
@@ -341,5 +465,100 @@ mod tests {
             compare_versions("1.0.0-rc2", "1.0.0-rc1"),
             Ordering::Greater
         );
+    }
+
+    // --- version requirements -------------------------------------------
+
+    #[test]
+    fn version_req_parses_each_supported_shape() {
+        assert_eq!(
+            VersionReq::parse("1.0.0"),
+            Ok(VersionReq::Exact("1.0.0".into()))
+        );
+        assert_eq!(
+            VersionReq::parse("=1.0.0"),
+            Ok(VersionReq::Exact("1.0.0".into()))
+        );
+        assert_eq!(
+            VersionReq::parse(">=1.0.0"),
+            Ok(VersionReq::AtLeast("1.0.0".into()))
+        );
+        assert_eq!(
+            VersionReq::parse("^1.0"),
+            Ok(VersionReq::Caret("1.0".into()))
+        );
+        // Whitespace around the requirement and operator is tolerated.
+        assert_eq!(
+            VersionReq::parse("  >= 1.2.3 "),
+            Ok(VersionReq::AtLeast("1.2.3".into()))
+        );
+    }
+
+    #[test]
+    fn version_req_exact_match() {
+        let req = VersionReq::parse("1.0.0").unwrap();
+        assert!(req.matches("1.0.0"));
+        // `1.0` == `1.0.0` per compare_versions.
+        assert!(req.matches("1.0"));
+        assert!(!req.matches("1.0.1"));
+        assert!(!req.matches("2.0.0"));
+    }
+
+    #[test]
+    fn version_req_newer_compatible_version_matches() {
+        // `>=` accepts anything at or above the bound.
+        let at_least = VersionReq::parse(">=1.0.0").unwrap();
+        assert!(at_least.matches("1.0.0"));
+        assert!(at_least.matches("1.5.0"));
+        assert!(at_least.matches("2.0.0"));
+
+        // `^1.0` accepts newer 1.x releases (a newer *compatible* version).
+        let caret = VersionReq::parse("^1.0").unwrap();
+        assert!(caret.matches("1.0.0"));
+        assert!(caret.matches("1.2.0"));
+        assert!(caret.matches("1.99.99"));
+
+        // Caret against a 0.x base is compatible only within the same minor.
+        let caret_zero = VersionReq::parse("^0.2.3").unwrap();
+        assert!(caret_zero.matches("0.2.3"));
+        assert!(caret_zero.matches("0.2.9"));
+    }
+
+    #[test]
+    fn version_req_incompatible_version_does_not_match() {
+        // Below a `>=` bound.
+        assert!(!VersionReq::parse(">=1.0.0").unwrap().matches("0.9.0"));
+
+        // A caret bump past the compatible range.
+        let caret = VersionReq::parse("^1.0").unwrap();
+        assert!(!caret.matches("2.0.0"));
+        assert!(!caret.matches("0.9.0"));
+
+        // 0.x caret: a minor bump is incompatible.
+        let caret_zero = VersionReq::parse("^0.2.3").unwrap();
+        assert!(!caret_zero.matches("0.3.0"));
+        assert!(!caret_zero.matches("0.2.2"));
+    }
+
+    #[test]
+    fn version_req_invalid_requirements_are_errors() {
+        assert_eq!(VersionReq::parse(""), Err(VersionReqError::Empty));
+        assert_eq!(VersionReq::parse("   "), Err(VersionReqError::Empty));
+        assert!(matches!(
+            VersionReq::parse("^"),
+            Err(VersionReqError::Invalid(_))
+        ));
+        assert!(matches!(
+            VersionReq::parse(">="),
+            Err(VersionReqError::Invalid(_))
+        ));
+        assert!(matches!(
+            VersionReq::parse(">=abc"),
+            Err(VersionReqError::Invalid(_))
+        ));
+        assert!(matches!(
+            VersionReq::parse("1..0"),
+            Err(VersionReqError::Invalid(_))
+        ));
     }
 }

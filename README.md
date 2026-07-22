@@ -16,6 +16,9 @@ non-trivial behavior is unit-testable without spawning a terminal.
   the registry before extraction, with zip-slip protection.
 - **Swappable registry** — a `RegistryClient` trait behind which today's
   embedded/mock backend can be replaced by HTTP or IPFS without touching any command.
+- **Readable output** — aligned tables, labeled detail views, and staged
+  install feedback, with optional machine-readable `--json` for `list`,
+  `search`, and `info`.
 - **Scriptable** — failed runs exit non-zero; batch installs report per-package
   success/failure so `$?` is meaningful.
 
@@ -39,7 +42,10 @@ cargo install --path .
 ## Usage
 
 ```bash
-# Start a new project in the current directory
+# Scaffold a brand new project in its own directory (smod.toml, src/lib.rs, README.md)
+smod new my-module
+
+# Or initialize a project in the current directory
 smod init --name my-app
 
 # Discover packages
@@ -54,6 +60,11 @@ smod install
 
 # Inspect what's declared vs. installed
 smod list
+
+# Machine-readable output for scripting
+smod list --json
+smod search payment --json
+smod info payment-stream --json
 
 # Remove a package (deletes its module dir + lockfile + manifest entries)
 smod remove payment-stream
@@ -70,7 +81,17 @@ smod doctor
 ```
 
 Global flags: `--no-color` disables colored output; `--verbose` is accepted
-(reserved for future logging).
+(reserved for future logging). `--json` (on `list`, `search`, and `info`)
+switches that command to machine-readable JSON; human-readable output is the
+default.
+
+### Dependency version requirements
+
+Dependency versions in `smod.toml` may be an exact version (`1.2.3`), a minimum
+(`>=1.0.0`), or a caret range (`^1.0`). `smod list` reports whether the
+installed version satisfies the declared requirement. This is a deliberately
+small subset — `smod` implements it directly rather than depending on a full
+semver crate.
 
 ### Bundled registry
 
@@ -92,12 +113,15 @@ src/
 ├── cli.rs           # clap schema (pure data)
 ├── commands/        # one file per subcommand (orchestration only)
 ├── installer.rs     # install/remove/update/verify workflows (business logic)
+├── scaffold.rs      # `smod new` project generation (business logic)
 ├── doctor.rs        # environment diagnostics (business logic)
 ├── config.rs        # smod.toml filesystem boundary
 ├── lockfile.rs      # smod.lock read/write + timestamps
 ├── registry.rs      # RegistryClient trait + MockRegistryClient
-├── package.rs       # pure Manifest data model
-└── ui/              # spinners/progress bars (presentation only)
+├── package.rs       # pure Manifest data model + version requirements
+└── ui/              # spinners, progress bars, tables, JSON (presentation only)
+tests/
+└── cli.rs           # end-to-end tests that drive the compiled binary
 ```
 
 The one rule the codebase protects: **commands never do work — they ask a lower

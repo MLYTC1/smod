@@ -8,7 +8,7 @@ use clap::Args;
 use colored::Colorize;
 
 use crate::config;
-use crate::installer::{DependencyOutcome, Installer};
+use crate::installer::{DependencyOutcome, InstallStage, Installer};
 use crate::registry::MockRegistryClient;
 use crate::ui;
 
@@ -48,10 +48,14 @@ async fn install_single(
     project_root: std::path::PathBuf,
     package: &str,
 ) -> anyhow::Result<()> {
-    let spinner = ui::spinner::new(format!("installing {package}"));
     let installer = Installer::new(registry, project_root);
-    let result = installer.install_one(package).await;
-    spinner.finish_and_clear();
+
+    // The business layer reports each stage through this callback; deciding how
+    // to display them is the command's job, not the installer's.
+    let mut on_stage = |stage: InstallStage| println!("{}", stage_line(stage));
+    let result = installer
+        .install_with_progress(package, &mut on_stage)
+        .await;
 
     let installed = result?;
     let short_checksum: String = installed.checksum.chars().take(12).collect();
@@ -68,6 +72,17 @@ async fn install_single(
     );
     println!("    {} sha256:{}", "checksum".dimmed(), short_checksum);
     Ok(())
+}
+
+/// Map an [`InstallStage`] to its human-readable progress line.
+fn stage_line(stage: InstallStage) -> String {
+    let (symbol, text) = match stage {
+        InstallStage::Resolving => ("→", "Resolving package"),
+        InstallStage::Verifying => ("→", "Verifying checksum"),
+        InstallStage::Extracting => ("→", "Extracting archive"),
+        InstallStage::UpdatingLockfile => ("→", "Updating lockfile"),
+    };
+    format!("  {} {}", symbol.cyan(), text.dimmed())
 }
 
 async fn install_all(

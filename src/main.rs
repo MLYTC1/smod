@@ -12,6 +12,7 @@ mod installer;
 mod lockfile;
 mod package;
 mod registry;
+mod scaffold;
 mod ui;
 
 use clap::Parser;
@@ -36,6 +37,7 @@ async fn main() {
 /// The single dispatch point mapping each subcommand to its `run`.
 async fn dispatch(command: Commands) -> anyhow::Result<()> {
     match command {
+        Commands::New(args) => commands::new::run(args).await,
         Commands::Init(args) => commands::init::run(args).await,
         Commands::Install(args) => commands::install::run(args).await,
         Commands::Search(args) => commands::search::run(args).await,

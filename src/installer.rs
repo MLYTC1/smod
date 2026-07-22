@@ -107,6 +107,26 @@ pub enum RemoveError {
     Manifest(#[from] ConfigError),
 }
 
+/// A stage of the single-package install pipeline, reported to a caller-supplied
+/// progress callback as each step is entered.
+///
+/// This is how a command renders "resolving… / verifying… / extracting… /
+/// updating lockfile…" progress without the business layer ever printing:
+/// [`Installer::install_with_progress`] calls the callback with each stage, and
+/// the command decides how (or whether) to display it. The variants are ordered
+/// to match the pipeline in `ARCHITECTURE.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallStage {
+    /// Looking the package up in the registry.
+    Resolving,
+    /// Reading the archive and verifying its checksum.
+    Verifying,
+    /// Extracting the archive into `smod_modules/`.
+    Extracting,
+    /// Recording the install in `smod.lock` and `smod.toml`.
+    UpdatingLockfile,
+}
+
 /// The result of a successful single-package install.
 #[derive(Debug, Clone)]
 pub struct InstalledPackage {
@@ -211,8 +231,28 @@ impl<'a, R: RegistryClient> Installer<'a, R> {
     /// Install a single package by name (or query the registry accepts).
     ///
     /// Runs the pipeline documented in `ARCHITECTURE.md`, returning at the
-    /// first failure.
+    /// first failure. This is a convenience wrapper over
+    /// [`install_with_progress`](Installer::install_with_progress) with a no-op
+    /// progress callback — use that variant when a command wants to render
+    /// per-stage progress.
     pub async fn install(&self, package_query: &str) -> Result<InstalledPackage, InstallError> {
+        self.install_with_progress(package_query, &mut |_| {}).await
+    }
+
+    /// Like [`install`](Installer::install), but reports each [`InstallStage`]
+    /// to `on_stage` as it is entered.
+    ///
+    /// The callback is the seam that lets the CLI layer show progress without
+    /// this module ever printing: it is invoked with each stage, and the caller
+    /// decides how to render it. Passing a no-op closure (as [`install`] does)
+    /// makes this behave exactly like a plain install.
+    ///
+    /// [`install`]: Installer::install
+    pub async fn install_with_progress(
+        &self,
+        package_query: &str,
+        on_stage: &mut dyn FnMut(InstallStage),
+    ) -> Result<InstalledPackage, InstallError> {
         // 1. Confirm we are in a smod project.
         if !config::is_smod_project(&self.project_root) {
             return Err(InstallError::NotASmodProject {
@@ -221,15 +261,16 @@ impl<'a, R: RegistryClient> Installer<'a, R> {
         }
 
         // 2. Resolve the package via the registry.
+        on_stage(InstallStage::Resolving);
         let info = self.registry.get_package(package_query).await?;
 
         // 2a. Reject unsafe names before any of them become a filesystem path.
         package::validate_package_name(&info.name)?;
 
         // 3. Resolve where the archive lives, and 4. read its bytes.
-        let bytes = self.read_archive(&info)?;
-
         // 5. Compute and 6. verify the checksum.
+        on_stage(InstallStage::Verifying);
+        let bytes = self.read_archive(&info)?;
         let checksum = Self::compute_checksum(&bytes);
         self.verify_checksum(&info, &checksum)?;
 
@@ -237,12 +278,14 @@ impl<'a, R: RegistryClient> Installer<'a, R> {
         //    place. Extraction never writes directly into the final directory,
         //    so a failed extraction can't leave partial files and a reinstall
         //    can't leave stale files from an older version.
+        on_stage(InstallStage::Extracting);
         let modules_dir = config::modules_dir_in(&self.project_root);
         let install_path = modules_dir.join(&info.name);
         let staging_path = modules_dir.join(format!(".{}.tmp", info.name));
         self.install_into_place(&bytes, &staging_path, &install_path)?;
 
         // 8. Record in the lockfile, then 9. add to the manifest.
+        on_stage(InstallStage::UpdatingLockfile);
         self.write_lockfile(&info, &checksum)?;
         config::add_dependency(&self.project_root, &info.name, &info.version)?;
 
@@ -816,6 +859,7 @@ mod tests {
             program_id: "Prog".to_string(),
             archive: archive_path.to_string_lossy().to_string(),
             checksum,
+            dependencies: Default::default(),
         };
         let registry = MockRegistryClient::from_packages(vec![info]);
         (tmp, registry)
@@ -831,6 +875,7 @@ mod tests {
             program_id: "p".into(),
             archive: archive.to_string_lossy().to_string(),
             checksum: None,
+            dependencies: Default::default(),
         }
     }
 
@@ -871,6 +916,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn install_with_progress_reports_stages_in_order() {
+        let zip = make_zip(&[("p/lib.rs", b"v1")]);
+        let (tmp, registry) = scaffold("p", &zip, None);
+        let installer = Installer::new(&registry, tmp.path().to_path_buf());
+
+        let mut stages = Vec::new();
+        installer
+            .install_with_progress("p", &mut |stage| stages.push(stage))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stages,
+            vec![
+                InstallStage::Resolving,
+                InstallStage::Verifying,
+                InstallStage::Extracting,
+                InstallStage::UpdatingLockfile,
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn install_not_a_project_errors() {
         let zip = make_zip(&[("p/f.txt", b"x")]);
         let (tmp, registry) = scaffold("p", &zip, None);
@@ -902,6 +970,7 @@ mod tests {
             program_id: "p".into(),
             archive: tmp.path().join("nope.zip").to_string_lossy().to_string(),
             checksum: None,
+            dependencies: Default::default(),
         };
         let registry = MockRegistryClient::from_packages(vec![info]);
         let installer = Installer::new(&registry, tmp.path().to_path_buf());
@@ -1220,6 +1289,7 @@ mod tests {
                 program_id: "p".into(),
                 archive: path_a.to_string_lossy().into(),
                 checksum: None,
+                dependencies: Default::default(),
             },
             PackageInfo {
                 name: "b".into(),
@@ -1229,6 +1299,7 @@ mod tests {
                 program_id: "p".into(),
                 archive: path_b.to_string_lossy().into(),
                 checksum: None,
+                dependencies: Default::default(),
             },
             // Note: "c" is declared but not in the registry -> Failed.
         ]);
@@ -1324,6 +1395,7 @@ mod tests {
                 program_id: "p".into(),
                 archive: archive_path.to_string_lossy().into(),
                 checksum: None,
+                dependencies: Default::default(),
             };
             let registry = MockRegistryClient::from_packages(vec![info]);
             let installer = Installer::new(&registry, tmp.path().to_path_buf());

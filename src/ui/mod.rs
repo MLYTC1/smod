@@ -4,5 +4,7 @@
 //! idea a terminal exists. Nothing here does any work; these are purely
 //! cosmetic wrappers around `indicatif`.
 
+pub mod json;
 pub mod progress;
 pub mod spinner;
+pub mod table;

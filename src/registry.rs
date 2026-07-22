@@ -6,6 +6,7 @@
 //! concrete client type. That is what will let an `HttpRegistryClient` drop in
 //! later without touching commands — see `ARCHITECTURE.md`.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,17 @@ pub struct PackageInfo {
     /// Optional archive checksum. When present, install verifies against it.
     #[serde(default)]
     pub checksum: Option<String>,
+    /// The package's own declared dependencies (`name -> version requirement`),
+    /// as published to the registry.
+    ///
+    /// This is registry *metadata* about a package — distinct from a project's
+    /// `[smod.dependencies]` table in [`crate::package::Manifest`]. It is stored
+    /// as a [`BTreeMap`] so it serializes in a stable, sorted order, and defaults
+    /// to empty so older registry documents (and archives) deserialize
+    /// unchanged. `smod` surfaces it via `smod info`; it does not (yet) drive
+    /// transitive installation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dependencies: BTreeMap<String, String>,
 }
 
 /// Where package metadata comes from.
@@ -184,7 +196,8 @@ mod tests {
                 "author": "smod",
                 "program_id": "Pay111",
                 "archive": "./packages/payment-stream.zip",
-                "checksum": "deadbeef"
+                "checksum": "deadbeef",
+                "dependencies": { "token-vault": ">=2.0.0" }
             },
             {
                 "name": "token-vault",
@@ -224,9 +237,21 @@ mod tests {
         let found = client.get_package("token-vault").await.unwrap();
         assert_eq!(found.version, "2.1.0");
         assert!(found.checksum.is_none());
+        // Absent in the JSON -> defaults to an empty table, not an error.
+        assert!(found.dependencies.is_empty());
 
         let err = client.get_package("nope").await.unwrap_err();
         assert!(matches!(err, RegistryError::PackageNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn dependencies_are_parsed_when_present() {
+        let client = MockRegistryClient::from_json_str(JSON).unwrap();
+        let pkg = client.get_package("payment-stream").await.unwrap();
+        assert_eq!(
+            pkg.dependencies.get("token-vault").map(String::as_str),
+            Some(">=2.0.0")
+        );
     }
 
     #[tokio::test]
