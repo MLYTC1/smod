@@ -123,8 +123,9 @@ Why this shape specifically:
 ## Module map
 
 ### `src/main.rs`
-The entire binary entry point. Parses `Cli::parse()`, applies `--no-color`,
-and `match`es `cli.command` to the right `commands::*::run(args).await`.
+The entire binary entry point. Parses `Cli::parse()`, configures colored
+output via `ui::color::init` (which honors `--no-color` and auto-disables
+color on terminals that can't render ANSI), and `match`es `cli.command` to the right `commands::*::run(args).await`.
 That `match` (`dispatch`) is the *only* place that knows all the
 subcommands exist. If `dispatch` returns `Err`, `main` prints
 `error: {rendered chain}` in red and exits `1`. There is no logic here
@@ -297,8 +298,17 @@ and archive-reading path (`read_archive`) as `install`, so no checksum logic is
 duplicated.
 
 ### `src/ui/`
-Presentation helpers, only ever touched by `commands/*.rs` and never by
-business logic. Two tiny `indicatif` wrappers — `spinner::new(message)`
+Presentation helpers, only ever touched by `commands/*.rs` and the binary
+entry point, and never by business logic. `color` is the single place that
+decides whether ANSI-colored output is enabled: `color::init(no_color)` (called
+once from `main.rs`) honors `--no-color`/`NO_COLOR` and `CLICOLOR_FORCE` as
+explicit overrides and otherwise enables color only when stdout is a terminal
+that actually understands ANSI escapes — on Windows it first tries to turn on
+the console's virtual-terminal processing (via a small, dependency-free FFI
+shim) so codes aren't printed literally, and disables color automatically when
+it can't. The pure decision (`should_colorize`) is unit-tested independent of
+any real terminal. Alongside it are two tiny `indicatif` wrappers —
+`spinner::new(message)`
 (indeterminate) and `progress::new(total)` (a determinate byte-progress bar,
 styled and ready for streamed HTTP downloads, currently unused and that's
 fine) — plus two output helpers: `table::render(headers, rows)` (fixed-width
@@ -337,7 +347,7 @@ lockfile     ─> package (only the shared validate_package_name gate)
 registry     ─> (nothing internal - self-contained)
 package      ─> (nothing internal - leaf module)
 
-ui  ─> (nothing internal - leaf module; external indicatif + serde_json)
+ui  ─> (nothing internal - leaf module; external colored + indicatif + serde_json)
 ```
 
 Two things worth noticing:

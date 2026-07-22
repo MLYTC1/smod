@@ -60,7 +60,7 @@ pub enum Commands {
     Info(commands::info::InfoArgs),
     /// Diagnose the local project and environment.
     Doctor(commands::doctor::DoctorArgs),
-    /// Update installed packages (not yet implemented).
+    /// Update installed packages to the newest registry version.
     Update(commands::update::UpdateArgs),
     /// Verify installed packages match their recorded checksums.
     Verify(commands::verify::VerifyArgs),

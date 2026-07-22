@@ -1,8 +1,8 @@
 //! `smod` binary entry point.
 //!
-//! Parses argv, applies `--no-color`, and dispatches to the right command
-//! module. There is no business logic here by design — `dispatch` is the only
-//! place that knows all the subcommands exist.
+//! Parses argv, configures colored output via [`ui::color`], and dispatches to
+//! the right command module. There is no business logic here by design —
+//! `dispatch` is the only place that knows all the subcommands exist.
 
 mod cli;
 mod commands;
@@ -24,9 +24,9 @@ use cli::{Cli, Commands};
 async fn main() {
     let cli = Cli::parse();
 
-    if cli.no_color {
-        colored::control::set_override(false);
-    }
+    // Decide colored output once, up front: honor --no-color/NO_COLOR, and
+    // otherwise auto-disable on terminals that can't process ANSI escapes.
+    ui::color::init(cli.no_color);
 
     if let Err(err) = dispatch(cli.command).await {
         eprintln!("{} {:#}", "error:".red().bold(), err);
