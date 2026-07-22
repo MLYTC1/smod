@@ -15,7 +15,7 @@ non-trivial behavior is unit-testable without spawning a terminal.
 - **Verified installs** — archives are SHA-256 checksummed and verified against
   the registry before extraction, with zip-slip protection.
 - **Swappable registry** — a `RegistryClient` trait behind which today's
-  embedded/mock backend can be replaced by HTTP without touching any command.
+  embedded/mock backend can be replaced by HTTP or IPFS without touching any command.
 - **Scriptable** — failed runs exit non-zero; batch installs report per-package
   success/failure so `$?` is meaningful.
 
