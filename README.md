@@ -27,7 +27,7 @@ non-trivial behavior is unit-testable without spawning a terminal.
 Requires Rust **1.75+** (for native `async fn` in traits).
 
 ```bash
-git clone https://github.com/MLYTC1/smod.git smod
+git clone https://github.com/MLYTC1/smod smod
 cd smod
 cargo build --release
 # the binary is at target/release/smod (smod.exe on Windows)
