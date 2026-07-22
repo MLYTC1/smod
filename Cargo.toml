@@ -1,0 +1,32 @@
+[package]
+name = "smod"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "A cargo/npm-style package manager for Solana modules"
+license = "MIT"
+repository = "https://github.com/example/smod"
+readme = "README.md"
+
+[[bin]]
+name = "smod"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+colored = "2"
+indicatif = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true

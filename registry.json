@@ -1,0 +1,49 @@
+{
+  "packages": [
+    {
+      "name": "payment-stream",
+      "version": "1.0.0",
+      "description": "Streaming SPL-token payments with per-second release schedules.",
+      "author": "smod-labs",
+      "program_id": "Pay1nStrEamProgram11111111111111111111111",
+      "archive": "./packages/payment-stream.zip",
+      "checksum": "6e05f44ac0624b38c98975ada5484a15b1373e7270cc8f0aca12de094fca06c3"
+    },
+    {
+      "name": "token-vault",
+      "version": "2.1.0",
+      "description": "A secure, audited vault for holding and releasing SPL tokens.",
+      "author": "smod-labs",
+      "program_id": "Vau1tTokenProgram1111111111111111111111111",
+      "archive": "./packages/token-vault.zip",
+      "checksum": "f098d6bc69967e28365f0014b99b1cc9dfef37b7328b352006744c1021d1f35a"
+    },
+    {
+      "name": "nft-mint",
+      "version": "0.9.3",
+      "description": "Minimal NFT minting and metadata program for Solana.",
+      "author": "mintworks",
+      "program_id": "NFTm1ntProgram111111111111111111111111111",
+      "archive": "./packages/nft-mint.zip",
+      "checksum": "7b5f0a4a3deaaebe791f1b8b538ccf85648156f0d029142ee05ab7e9dc405fbb"
+    },
+    {
+      "name": "staking-pool",
+      "version": "1.4.2",
+      "description": "Delegated staking pool with reward accrual and slashing.",
+      "author": "stake-dao",
+      "program_id": "StakePoo1Program11111111111111111111111111",
+      "archive": "./packages/staking-pool.zip",
+      "checksum": "346abc9df4acf36f883381712943099907085828519161380b2f6acd46ae9829"
+    },
+    {
+      "name": "oracle-feed",
+      "version": "3.0.1",
+      "description": "On-chain price oracle aggregator with confidence intervals.",
+      "author": "oracle-collective",
+      "program_id": "Orac1eFeedProgram111111111111111111111111",
+      "archive": "./packages/oracle-feed.zip",
+      "checksum": "789f52df533f33b089895faa48e360df19b38ca3aa3c7bd621e9c6b01fdf3779"
+    }
+  ]
+}
