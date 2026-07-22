@@ -5,14 +5,19 @@
 //! packages installed yet" are the same thing, so [`read`] returns an empty
 //! [`Lockfile`] in that case.
 //!
-//! This module is self-contained — it imports nothing else from the crate — so
-//! it can be read start to finish on its own.
+//! This module is nearly self-contained: its only internal dependency is the
+//! shared, pure [`validate_package_name`](crate::package::validate_package_name)
+//! gate in `package.rs`, which [`read`] applies to every entry so that a
+//! hand-edited `smod.lock` cannot smuggle in a name that escapes
+//! `smod_modules/` when it is later used as a path.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::package::{validate_package_name, PackageNameError};
 
 /// The lockfile filename.
 pub const LOCKFILE_FILE: &str = "smod.lock";
@@ -31,6 +36,14 @@ pub enum LockfileError {
     /// The lockfile exists but is not valid TOML / does not match the schema.
     #[error("invalid lockfile at {path}: {message}")]
     InvalidLockfile { path: PathBuf, message: String },
+
+    /// The lockfile contains an entry whose name is unsafe as a path component.
+    #[error("lockfile at {path} contains an unsafe package name: {source}")]
+    InvalidPackageName {
+        path: PathBuf,
+        #[source]
+        source: PackageNameError,
+    },
 }
 
 /// A single locked (installed) package.
@@ -95,10 +108,21 @@ pub fn read(dir: &Path) -> Result<Lockfile, LockfileError> {
         path: path.clone(),
         source,
     })?;
-    toml::from_str(&text).map_err(|e| LockfileError::InvalidLockfile {
-        path,
+    let lockfile: Lockfile = toml::from_str(&text).map_err(|e| LockfileError::InvalidLockfile {
+        path: path.clone(),
         message: e.to_string(),
-    })
+    })?;
+
+    // Defense in depth: reject any entry whose name could escape `smod_modules/`
+    // when later used as a path (e.g. a maliciously hand-edited lockfile).
+    for pkg in &lockfile.packages {
+        validate_package_name(&pkg.name).map_err(|source| LockfileError::InvalidPackageName {
+            path: path.clone(),
+            source,
+        })?;
+    }
+
+    Ok(lockfile)
 }
 
 /// Serialize and write `lockfile` to `dir/smod.lock`.
@@ -208,6 +232,33 @@ mod tests {
         std::fs::write(lockfile_path_in(tmp.path()), "not [ valid").unwrap();
         let err = read(tmp.path()).unwrap_err();
         assert!(matches!(err, LockfileError::InvalidLockfile { .. }));
+    }
+
+    #[test]
+    fn read_rejects_malicious_package_names() {
+        for bad in ["../evil", "../../outside", "/absolute/path", "..", "a/b"] {
+            let tmp = TempDir::new().unwrap();
+            let toml = format!(
+                "[[packages]]\nname = {bad:?}\nversion = \"1.0.0\"\n\
+                 checksum = \"x\"\ninstalled_at = \"1970-01-01T00:00:00Z\"\n"
+            );
+            std::fs::write(lockfile_path_in(tmp.path()), toml).unwrap();
+            let err = read(tmp.path()).unwrap_err();
+            assert!(
+                matches!(err, LockfileError::InvalidPackageName { .. }),
+                "name {bad:?} should be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_accepts_valid_package_names() {
+        let tmp = TempDir::new().unwrap();
+        let mut lock = Lockfile::default();
+        lock.upsert(pkg("payment-stream", "1.0.0"));
+        lock.upsert(pkg("my_module", "2.0.0"));
+        write(tmp.path(), &lock).unwrap();
+        assert!(read(tmp.path()).is_ok());
     }
 
     // --- civil_from_days edge cases -------------------------------------

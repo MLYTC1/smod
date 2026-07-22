@@ -15,6 +15,7 @@ use thiserror::Error;
 
 use crate::config::{self, ConfigError};
 use crate::lockfile::{self, LockedPackage, LockfileError};
+use crate::package::{self, PackageNameError};
 use crate::registry::{PackageInfo, RegistryClient, RegistryError};
 
 /// Errors produced while installing a package.
@@ -27,6 +28,10 @@ pub enum InstallError {
     /// The registry lookup failed.
     #[error(transparent)]
     Registry(#[from] RegistryError),
+
+    /// The registry returned a package whose name is unsafe as a path component.
+    #[error("registry returned an unsafe package name: {0}")]
+    InvalidPackageName(#[from] PackageNameError),
 
     /// The resolved archive path does not exist.
     #[error("package archive not found at {path}")]
@@ -70,6 +75,10 @@ pub enum RemoveError {
     /// The target directory is not a smod project.
     #[error("not a smod project: {path} (run `smod init` first)")]
     NotASmodProject { path: PathBuf },
+
+    /// The requested name is unsafe as a path component.
+    #[error("unsafe package name: {0}")]
+    InvalidPackageName(#[from] PackageNameError),
 
     /// The package is not installed (absent from `smod.lock`).
     #[error("package `{name}` is not installed")]
@@ -144,6 +153,9 @@ impl<'a, R: RegistryClient> Installer<'a, R> {
 
         // 2. Resolve the package via the registry.
         let info = self.registry.get_package(package_query).await?;
+
+        // 2a. Reject unsafe names before any of them become a filesystem path.
+        package::validate_package_name(&info.name)?;
 
         // 3. Resolve where the archive lives, and 4. read its bytes.
         let archive_path = self.resolve_archive_path(&info.archive);
@@ -374,6 +386,9 @@ pub fn remove_package(project_root: &Path, name: &str) -> Result<(), RemoveError
             path: project_root.to_path_buf(),
         });
     }
+
+    // Reject unsafe names before `name` is joined into a path to delete.
+    package::validate_package_name(name)?;
 
     let mut lock = lockfile::read(project_root)?;
     if lock.get(name).is_none() {
@@ -705,5 +720,74 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let err = remove_package(tmp.path(), "ghost").unwrap_err();
         assert!(matches!(err, RemoveError::NotASmodProject { .. }));
+    }
+
+    // --- security: package-name path traversal --------------------------
+
+    #[tokio::test]
+    async fn install_rejects_malicious_registry_names_without_escaping() {
+        let tmp = TempDir::new().unwrap();
+        config::write_manifest(tmp.path(), &Manifest::new("host")).unwrap();
+        // A real archive on disk, so a failure to validate is the *only* thing
+        // that can stop an escape (the pipeline would otherwise read it).
+        let zip = make_zip(&[("evil.txt", b"pwned")]);
+        let archive_path = tmp.path().join("archive.zip");
+        std::fs::write(&archive_path, &zip).unwrap();
+
+        for bad in [
+            "../evil",
+            "../../outside",
+            "/absolute/path",
+            "a/b",
+            "a\\b",
+            ".",
+        ] {
+            let info = PackageInfo {
+                name: bad.to_string(),
+                version: "1.0.0".into(),
+                description: "d".into(),
+                author: "a".into(),
+                program_id: "p".into(),
+                archive: archive_path.to_string_lossy().into(),
+                checksum: None,
+            };
+            let registry = MockRegistryClient::from_packages(vec![info]);
+            let installer = Installer::new(&registry, tmp.path().to_path_buf());
+            let err = installer.install(bad).await.unwrap_err();
+            assert!(
+                matches!(err, InstallError::InvalidPackageName(_)),
+                "name {bad:?} should be rejected, got {err:?}"
+            );
+        }
+
+        // Nothing escaped the project: no sibling dirs were created, and the
+        // modules dir was never populated.
+        let parent = tmp.path().parent().unwrap();
+        assert!(!parent.join("evil").exists());
+        assert!(!parent.join("outside").exists());
+        assert!(!config::modules_dir_in(tmp.path()).join("evil").exists());
+    }
+
+    #[test]
+    fn remove_rejects_malicious_names() {
+        let tmp = TempDir::new().unwrap();
+        config::write_manifest(tmp.path(), &Manifest::new("host")).unwrap();
+        for bad in ["../evil", "..", "a/b", "C:\\x", ""] {
+            let err = remove_package(tmp.path(), bad).unwrap_err();
+            assert!(
+                matches!(err, RemoveError::InvalidPackageName(_)),
+                "name {bad:?} should be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn install_still_works_for_valid_names() {
+        // Guard against over-restriction of the validator.
+        let zip = make_zip(&[("my_module/lib.rs", b"// ok")]);
+        let (tmp, registry) = scaffold("my_module", &zip, None);
+        let installer = Installer::new(&registry, tmp.path().to_path_buf());
+        let installed = installer.install("my_module").await.unwrap();
+        assert!(installed.install_path.join("lib.rs").is_file());
     }
 }
